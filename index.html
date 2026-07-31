@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://accounts.google.com/gsi/client" async defer></script>
+
 <style>
   :root{
     --bg:#15181B; --bg-panel:#1D2226; --bg-panel-alt:#232A2F; --bg-raised:#282F34;
@@ -156,7 +156,6 @@ let stack = [{ id: ROOT_ID, name: ROOT_NAME }];
 let search = '';
 let adminToken = null;
 let adminEmail = null;
-let tokenClient = null;
 let currentItems = [];
 
 // ===================== ICONS =====================
@@ -187,51 +186,57 @@ function fmtSize(bytes){
 }
 function currentFolder(){ return stack[stack.length-1]; }
 
-// ===================== GOOGLE IDENTITY (ADMIN SIGN-IN) =====================
-function initGis(){
-  tokenClient = google.accounts.oauth2.initTokenClient({
+// ===================== GOOGLE SIGN-IN (same-window redirect flow) =====================
+function redirectUri(){ return window.location.origin + window.location.pathname; }
+
+function buildAuthUrl(){
+  const params = new URLSearchParams({
     client_id: CLIENT_ID,
+    redirect_uri: redirectUri(),
+    response_type: 'token',
     scope: SCOPES,
-    callback: async (resp) => {
-      if(resp.error){ alert('Sign-in failed: ' + resp.error); return; }
-      adminToken = resp.access_token;
+    include_granted_scopes: 'true',
+    prompt: 'consent'
+  });
+  return 'https://accounts.google.com/o/oauth2/v2/auth?' + params.toString();
+}
+
+function signIn(){
+  try{ sessionStorage.setItem('bsp-nav-stack', JSON.stringify(stack)); }catch(e){}
+  window.location.href = buildAuthUrl();
+}
+
+function signOut(){
+  const token = adminToken;
+  adminToken = null; adminEmail = null;
+  renderAdminArea();
+  loadAndRender();
+  if(token){
+    fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(token), { method:'POST' }).catch(() => {});
+  }
+}
+
+async function checkForRedirectToken(){
+  if(window.location.hash && window.location.hash.indexOf('access_token') !== -1){
+    const params = new URLSearchParams(window.location.hash.substring(1));
+    const token = params.get('access_token');
+    const err = params.get('error');
+    history.replaceState({ stack: JSON.parse(JSON.stringify(stack)) }, '', window.location.pathname + window.location.search);
+    if(err){ alert('Sign-in failed: ' + err); return; }
+    if(token){
+      adminToken = token;
       try{
         const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers:{ Authorization:'Bearer '+adminToken } });
         const info = await r.json();
         adminEmail = info.email || 'Admin';
       }catch(e){ adminEmail = 'Admin'; }
+      try{
+        const saved = sessionStorage.getItem('bsp-nav-stack');
+        if(saved){ stack = JSON.parse(saved); }
+      }catch(e){}
       renderAdminArea();
-      loadAndRender();
     }
-  });
-  renderAdminArea();
-}
-function waitForGis(attemptsLeft){
-  if(window.google && window.google.accounts && window.google.accounts.oauth2){
-    initGis();
-    return;
   }
-  if(attemptsLeft <= 0){ console.error('Google Identity Services failed to load.'); return; }
-  setTimeout(() => waitForGis(attemptsLeft - 1), 250);
-}
-function signIn(){
-  if(!tokenClient){
-    const btn = document.getElementById('signin-btn');
-    if(btn){ btn.textContent = 'Loading Google sign-in…'; btn.disabled = true; }
-    waitForGis(20);
-    setTimeout(() => {
-      if(tokenClient){ signIn(); }
-      else if(btn){ btn.textContent = '🔒 Sign in as Admin'; btn.disabled = false; alert('Google sign-in could not load — check your internet connection and try again.'); }
-    }, 5200);
-    return;
-  }
-  tokenClient.requestAccessToken({ prompt: adminToken ? '' : 'consent' });
-}
-function signOut(){
-  if(adminToken){ google.accounts.oauth2.revoke(adminToken, () => {}); }
-  adminToken = null; adminEmail = null;
-  renderAdminArea();
-  loadAndRender();
 }
 function renderAdminArea(){
   const el = document.getElementById('admin-area');
@@ -301,8 +306,18 @@ async function apiUploadResumable(file, parentId, onProgress){
 }
 
 // ===================== NAVIGATION =====================
-function goTo(index){ stack = stack.slice(0, index+1); search=''; loadAndRender(); }
-function enterFolder(id, name){ stack.push({id, name}); search=''; loadAndRender(); }
+function pushNavState(){
+  try{ history.pushState({ stack: JSON.parse(JSON.stringify(stack)) }, '', location.pathname + location.search); }catch(e){}
+}
+function goTo(index){ stack = stack.slice(0, index+1); search=''; pushNavState(); loadAndRender(); }
+function enterFolder(id, name){ stack.push({id, name}); search=''; pushNavState(); loadAndRender(); }
+
+window.addEventListener('popstate', (e) => {
+  if(e.state && e.state.stack && e.state.stack.length){ stack = e.state.stack; }
+  else { stack = [{ id: ROOT_ID, name: ROOT_NAME }]; }
+  search = '';
+  loadAndRender();
+});
 
 function renderCrumbs(){
   const c = document.getElementById('crumbline');
@@ -595,8 +610,8 @@ async function deleteFolder(folderId, name){
 
 // ===================== INIT =====================
 renderAdminArea();
-waitForGis(20);
-loadAndRender();
+history.replaceState({ stack: JSON.parse(JSON.stringify(stack)) }, '', location.pathname + location.search);
+checkForRedirectToken().then(() => { renderAdminArea(); loadAndRender(); });
 </script>
 </body>
 </html>
