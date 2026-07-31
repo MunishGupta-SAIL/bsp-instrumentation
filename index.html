@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://accounts.google.com/gsi/client" async defer onload="window.__gisLoaded && window.__gisLoaded()"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root{
     --bg:#15181B; --bg-panel:#1D2226; --bg-panel-alt:#232A2F; --bg-raised:#282F34;
@@ -188,7 +188,7 @@ function fmtSize(bytes){
 function currentFolder(){ return stack[stack.length-1]; }
 
 // ===================== GOOGLE IDENTITY (ADMIN SIGN-IN) =====================
-window.__gisLoaded = function(){
+function initGis(){
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID,
     scope: SCOPES,
@@ -205,9 +205,26 @@ window.__gisLoaded = function(){
     }
   });
   renderAdminArea();
-};
+}
+function waitForGis(attemptsLeft){
+  if(window.google && window.google.accounts && window.google.accounts.oauth2){
+    initGis();
+    return;
+  }
+  if(attemptsLeft <= 0){ console.error('Google Identity Services failed to load.'); return; }
+  setTimeout(() => waitForGis(attemptsLeft - 1), 250);
+}
 function signIn(){
-  if(!tokenClient){ alert('Google sign-in is still loading — try again in a moment.'); return; }
+  if(!tokenClient){
+    const btn = document.getElementById('signin-btn');
+    if(btn){ btn.textContent = 'Loading Google sign-in…'; btn.disabled = true; }
+    waitForGis(20);
+    setTimeout(() => {
+      if(tokenClient){ signIn(); }
+      else if(btn){ btn.textContent = '🔒 Sign in as Admin'; btn.disabled = false; alert('Google sign-in could not load — check your internet connection and try again.'); }
+    }, 5200);
+    return;
+  }
   tokenClient.requestAccessToken({ prompt: adminToken ? '' : 'consent' });
 }
 function signOut(){
@@ -578,6 +595,7 @@ async function deleteFolder(folderId, name){
 
 // ===================== INIT =====================
 renderAdminArea();
+waitForGis(20);
 loadAndRender();
 </script>
 </body>
