@@ -70,6 +70,9 @@
   .folder-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:14px; margin-bottom:8px;}
   .folder-card{position:relative; text-align:left; cursor:pointer; background:var(--bg-panel); border:1px solid var(--line); padding:18px 16px; border-radius:var(--radius); transition:border-color .18s ease, transform .18s ease, box-shadow .18s ease; display:flex; flex-direction:column; gap:10px;}
   .folder-card:hover{border-color:var(--blue); transform:translateY(-2px); box-shadow:0 8px 24px -8px var(--blue-glow);}
+  .folder-card[draggable="true"]{cursor:grab;}
+  .folder-card.dragging{opacity:0.4;}
+  .folder-card.drag-over{border-color:var(--amber); box-shadow:0 0 0 2px var(--amber-dim);}
   .folder-icon{color:var(--blue); width:24px; height:24px;}
   .folder-name{font-family:'Oswald', sans-serif; font-size:16px; font-weight:600; text-transform:uppercase; margin:0;}
   .folder-actions{position:absolute; top:10px; right:10px; display:flex; gap:3px; opacity:0; transition:opacity .15s; flex-wrap:wrap; justify-content:flex-end; max-width:140px;}
@@ -261,8 +264,21 @@ async function reorderFolder(folderId, direction){
   if(idx === -1 || swapIdx < 0 || swapIdx >= folders.length) return;
   const reordered = folders.slice();
   const tmp = reordered[idx]; reordered[idx] = reordered[swapIdx]; reordered[swapIdx] = tmp;
+  await persistFolderOrder(reordered);
+}
+async function reorderFolderToPosition(draggedId, targetId){
+  const folders = sortFolders(currentItems.filter(i => i.mimeType === FOLDER_MIME));
+  const fromIdx = folders.findIndex(f => f.id === draggedId);
+  const toIdx = folders.findIndex(f => f.id === targetId);
+  if(fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) return;
+  const reordered = folders.slice();
+  const [moved] = reordered.splice(fromIdx, 1);
+  reordered.splice(toIdx, 0, moved);
+  await persistFolderOrder(reordered);
+}
+async function persistFolderOrder(orderedFolders){
   try{
-    await Promise.all(reordered.map((f, i) => {
+    await Promise.all(orderedFolders.map((f, i) => {
       const mergedProps = Object.assign({}, f.properties || {}, { sortOrder: String(i) });
       return apiPatchFile(f.id, { properties: mergedProps });
     }));
@@ -410,7 +426,8 @@ function renderCrumbs(){
   stack.forEach((s, i) => {
     if(i>0) html += `<span class="crumb-sep"></span>`;
     const isLast = i === stack.length-1;
-    html += `<button class="crumb ${isLast?'current':''}" data-idx="${i}" ${isLast?'tabindex="-1"':''}><span class="crumb-node"></span>${escapeHtml(s.name)}</button>`;
+    const label = i === 0 ? pageText.title : s.name;
+    html += `<button class="crumb ${isLast?'current':''}" data-idx="${i}" ${isLast?'tabindex="-1"':''}><span class="crumb-node"></span>${escapeHtml(label)}</button>`;
   });
   c.innerHTML = html;
   c.querySelectorAll('.crumb:not(.current)').forEach(b => { b.onclick = () => goTo(parseInt(b.getAttribute('data-idx'),10)); });
@@ -438,7 +455,7 @@ function renderFolderView(){
 
   let html = `
     <div class="section-head">
-      <h2>${escapeHtml(currentFolder().name)}</h2>
+      <h2>${escapeHtml(stack.length === 1 ? pageText.title : currentFolder().name)}</h2>
       <div class="toolbar">
         <div class="search-box">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
@@ -497,6 +514,29 @@ function renderFolderView(){
     app.querySelectorAll('[data-action="delete-folder"]').forEach(b => b.onclick = () => deleteFolder(b.getAttribute('data-id'), b.getAttribute('data-name')));
     app.querySelectorAll('[data-action="move-up"]').forEach(b => b.onclick = () => reorderFolder(b.getAttribute('data-id'), -1));
     app.querySelectorAll('[data-action="move-down"]').forEach(b => b.onclick = () => reorderFolder(b.getAttribute('data-id'), 1));
+
+    let dragSrcId = null;
+    app.querySelectorAll('.folder-card').forEach(card => {
+      card.setAttribute('draggable', 'true');
+      card.addEventListener('dragstart', (e) => {
+        dragSrcId = card.getAttribute('data-id');
+        card.classList.add('dragging');
+        try{ e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', dragSrcId); }catch(err){}
+      });
+      card.addEventListener('dragend', () => {
+        card.classList.remove('dragging');
+        app.querySelectorAll('.folder-card').forEach(c => c.classList.remove('drag-over'));
+      });
+      card.addEventListener('dragover', (e) => { e.preventDefault(); card.classList.add('drag-over'); });
+      card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+      card.addEventListener('drop', (e) => {
+        e.preventDefault();
+        card.classList.remove('drag-over');
+        const targetId = card.getAttribute('data-id');
+        if(dragSrcId && dragSrcId !== targetId){ reorderFolderToPosition(dragSrcId, targetId); }
+        dragSrcId = null;
+      });
+    });
     app.querySelectorAll('[data-action="rename-file"]').forEach(b => b.onclick = () => openRenameModal(b.getAttribute('data-id'), b.getAttribute('data-name'), false));
     app.querySelectorAll('[data-action="edit-details"]').forEach(b => b.onclick = () => openDetailsModal(b.getAttribute('data-id')));
     app.querySelectorAll('[data-action="move-file"]').forEach(b => b.onclick = () => openMoveModal(b.getAttribute('data-id'), b.getAttribute('data-name')));
