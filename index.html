@@ -217,7 +217,6 @@ function signOut(){
 }
 
 async function checkForRedirectToken(){
-  console.log('DEBUG full URL on load:', window.location.href);
   if(window.location.hash && window.location.hash.indexOf('access_token') !== -1){
     const params = new URLSearchParams(window.location.hash.substring(1));
     const token = params.get('access_token');
@@ -237,10 +236,6 @@ async function checkForRedirectToken(){
       }catch(e){}
       renderAdminArea();
     }
-  } else if(window.location.hash && window.location.hash.length > 1){
-    alert('DEBUG — page loaded with unexpected hash: ' + window.location.hash.substring(0, 300));
-  } else if(window.location.search && window.location.search.length > 1){
-    alert('DEBUG — page loaded with unexpected query: ' + window.location.search.substring(0, 300));
   }
 }
 function renderAdminArea(){
@@ -615,8 +610,11 @@ async function deleteFolder(folderId, name){
 
 // ===================== INIT =====================
 renderAdminArea();
-history.replaceState({ stack: JSON.parse(JSON.stringify(stack)) }, '', location.pathname + location.search);
-checkForRedirectToken().then(() => { renderAdminArea(); loadAndRender(); });
+checkForRedirectToken().then(() => {
+  history.replaceState({ stack: JSON.parse(JSON.stringify(stack)) }, '', location.pathname + location.search);
+  renderAdminArea();
+  loadAndRender();
+});
 </script>
 </body>
 </html>
