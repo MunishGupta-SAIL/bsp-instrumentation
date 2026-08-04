@@ -174,11 +174,13 @@ let pageText = Object.assign({}, DEFAULT_TEXT);
 
 async function loadPageText(){
   try{
-    const url = `https://www.googleapis.com/drive/v3/files/${ROOT_ID}?fields=properties&key=${API_KEY}`;
+    const url = `https://www.googleapis.com/drive/v3/files/${ROOT_ID}?fields=description&key=${API_KEY}`;
     const res = await fetch(url);
     if(res.ok){
       const data = await res.json();
-      pageText = Object.assign({}, DEFAULT_TEXT, data.properties || {});
+      let saved = {};
+      try{ saved = data.description ? JSON.parse(data.description) : {}; }catch(e){ saved = {}; }
+      pageText = Object.assign({}, DEFAULT_TEXT, saved);
     }
   }catch(e){ /* fall back to defaults */ }
   renderPageText();
@@ -212,7 +214,7 @@ function openPageTextModal(){
       footerSignature: overlay.querySelector('#pt-footer-sig').value.trim() || DEFAULT_TEXT.footerSignature
     };
     try{
-      await apiPatchFile(ROOT_ID, { properties: updated });
+      await apiPatchFile(ROOT_ID, { description: JSON.stringify(updated) });
       pageText = updated;
       renderPageText();
       overlay.remove();
@@ -247,6 +249,9 @@ function fmtSize(bytes){
   return (n/(1024*1024)).toFixed(1) + ' MB';
 }
 function currentFolder(){ return stack[stack.length-1]; }
+function getFileMeta(item){
+  try{ return (item && item.description) ? JSON.parse(item.description) : {}; }catch(e){ return {}; }
+}
 function sortFolders(folders){
   return folders.slice().sort((a,b) => {
     const ao = (a.properties && a.properties.sortOrder !== undefined) ? parseInt(a.properties.sortOrder,10) : null;
@@ -352,7 +357,7 @@ function renderAdminArea(){
 
 // ===================== DRIVE READ (public, API key) =====================
 async function listFolder(folderId){
-  const fields = encodeURIComponent('files(id,name,mimeType,modifiedTime,webViewLink,size,properties)');
+  const fields = encodeURIComponent('files(id,name,mimeType,modifiedTime,webViewLink,size,properties,description)');
   const q = encodeURIComponent(`'${folderId}' in parents and trashed = false`);
   const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=${fields}&pageSize=200&orderBy=folder,name&key=${API_KEY}`;
   const res = await fetch(url);
@@ -545,7 +550,7 @@ function renderFolderView(){
 }
 
 function entryRowHtml(f){
-  const props = f.properties || {};
+  const props = getFileMeta(f);
   let badges = '';
   if(props.qty !== undefined && props.qty !== ''){
     const n = parseInt(props.qty, 10);
@@ -674,7 +679,7 @@ function openRenameModal(id, currentName, isFolder){
 
 function openDetailsModal(fileId){
   const file = currentItems.find(f => f.id === fileId);
-  const props = (file && file.properties) || {};
+  const props = getFileMeta(file);
   const overlay = openModal(`
     <h3>Edit Details</h3>
     <div class="field-row">
@@ -695,7 +700,7 @@ function openDetailsModal(fileId){
       qty: overlay.querySelector('#ed-qty').value.trim(),
       notes: overlay.querySelector('#ed-notes').value.trim()
     };
-    try{ await apiPatchFile(fileId, { properties }); overlay.remove(); loadAndRender(); }
+    try{ await apiPatchFile(fileId, { description: JSON.stringify(properties) }); overlay.remove(); loadAndRender(); }
     catch(e){ alert(e.message); }
   };
 }
