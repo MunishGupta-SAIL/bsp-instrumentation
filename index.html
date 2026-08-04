@@ -72,7 +72,8 @@
   .folder-card:hover{border-color:var(--blue); transform:translateY(-2px); box-shadow:0 8px 24px -8px var(--blue-glow);}
   .folder-icon{color:var(--blue); width:24px; height:24px;}
   .folder-name{font-family:'Oswald', sans-serif; font-size:16px; font-weight:600; text-transform:uppercase; margin:0;}
-  .folder-actions{position:absolute; top:10px; right:10px; display:flex; gap:4px; opacity:0; transition:opacity .15s;}
+  .folder-actions{position:absolute; top:10px; right:10px; display:flex; gap:3px; opacity:0; transition:opacity .15s; flex-wrap:wrap; justify-content:flex-end; max-width:140px;}
+  .folder-actions .btn-icon{padding:5px 6px; font-size:11px;}
   .folder-card:hover .folder-actions{opacity:1;}
 
   .entry-list{display:flex; flex-direction:column; gap:9px;}
@@ -130,9 +131,9 @@
 <div class="nameplate">
   <div class="nameplate-inner">
     <div>
-      <p class="eyebrow">BHILAI STEEL PLANT · SAIL <span>/ INSTRUMENTATION &amp; ELECTRICAL MAINTENANCE</span></p>
-      <h1 class="title">Instrumentation Department</h1>
-      <p class="subtitle">Live document portal — reads directly from Google Drive. Browse zone-wise manuals, drawings, calibration certificates &amp; spare details.</p>
+      <p class="eyebrow" id="page-eyebrow"></p>
+      <h1 class="title" id="page-title"></h1>
+      <p class="subtitle" id="page-subtitle"></p>
     </div>
     <div class="admin-area" id="admin-area"></div>
   </div>
@@ -140,7 +141,7 @@
 
 <div class="crumbline"><div class="crumbline-inner" id="crumbline"></div></div>
 <div class="wrap"><div id="app"></div></div>
-<div class="footer-note">FILES LIVE IN GOOGLE DRIVE — THIS PAGE ONLY DISPLAYS THEM · VIEW ACCESS IS PUBLIC, EDITING REQUIRES ADMIN SIGN-IN<br>INSTRUMENTATION DEPARTMENT · BHILAI STEEL PLANT, SAIL</div>
+<div class="footer-note"><span id="page-footer-main"></span><br><span id="page-footer-signature"></span></div>
 
 <script>
 // ===================== CONFIG =====================
@@ -157,6 +158,64 @@ let search = '';
 let adminToken = null;
 let adminEmail = null;
 let currentItems = [];
+
+// ===================== EDITABLE PAGE TEXT (stored on root folder in Drive) =====================
+const DEFAULT_TEXT = {
+  eyebrow: 'BHILAI STEEL PLANT · SAIL / INSTRUMENTATION & ELECTRICAL MAINTENANCE',
+  title: 'Instrumentation Department',
+  subtitle: 'Live document portal — reads directly from Google Drive. Browse zone-wise manuals, drawings, calibration certificates & spare details.',
+  footerMain: 'FILES LIVE IN GOOGLE DRIVE — THIS PAGE ONLY DISPLAYS THEM · VIEW ACCESS IS PUBLIC, EDITING REQUIRES ADMIN SIGN-IN',
+  footerSignature: 'INSTRUMENTATION DEPARTMENT · BHILAI STEEL PLANT, SAIL'
+};
+let pageText = Object.assign({}, DEFAULT_TEXT);
+
+async function loadPageText(){
+  try{
+    const url = `https://www.googleapis.com/drive/v3/files/${ROOT_ID}?fields=properties&key=${API_KEY}`;
+    const res = await fetch(url);
+    if(res.ok){
+      const data = await res.json();
+      pageText = Object.assign({}, DEFAULT_TEXT, data.properties || {});
+    }
+  }catch(e){ /* fall back to defaults */ }
+  renderPageText();
+}
+function renderPageText(){
+  document.getElementById('page-eyebrow').textContent = pageText.eyebrow;
+  document.getElementById('page-title').textContent = pageText.title;
+  document.getElementById('page-subtitle').textContent = pageText.subtitle;
+  document.getElementById('page-footer-main').textContent = pageText.footerMain;
+  document.getElementById('page-footer-signature').textContent = pageText.footerSignature;
+}
+function openPageTextModal(){
+  const overlay = openModal(`
+    <h3>Edit Page Text</h3>
+    <div class="field"><label>Eyebrow line</label><input type="text" id="pt-eyebrow" value="${escapeHtml(pageText.eyebrow)}"></div>
+    <div class="field"><label>Main Title</label><input type="text" id="pt-title" value="${escapeHtml(pageText.title)}"></div>
+    <div class="field"><label>Subtitle</label><textarea id="pt-subtitle" rows="3">${escapeHtml(pageText.subtitle)}</textarea></div>
+    <div class="field"><label>Footer — main line</label><input type="text" id="pt-footer-main" value="${escapeHtml(pageText.footerMain)}"></div>
+    <div class="field"><label>Footer — signature line</label><input type="text" id="pt-footer-sig" value="${escapeHtml(pageText.footerSignature)}"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="pt-cancel">Cancel</button>
+      <button class="btn btn-primary" id="pt-save">Save</button>
+    </div>`);
+  overlay.querySelector('#pt-cancel').onclick = () => overlay.remove();
+  overlay.querySelector('#pt-save').onclick = async () => {
+    const updated = {
+      eyebrow: overlay.querySelector('#pt-eyebrow').value.trim() || DEFAULT_TEXT.eyebrow,
+      title: overlay.querySelector('#pt-title').value.trim() || DEFAULT_TEXT.title,
+      subtitle: overlay.querySelector('#pt-subtitle').value.trim() || DEFAULT_TEXT.subtitle,
+      footerMain: overlay.querySelector('#pt-footer-main').value.trim() || DEFAULT_TEXT.footerMain,
+      footerSignature: overlay.querySelector('#pt-footer-sig').value.trim() || DEFAULT_TEXT.footerSignature
+    };
+    try{
+      await apiPatchFile(ROOT_ID, { properties: updated });
+      pageText = updated;
+      renderPageText();
+      overlay.remove();
+    }catch(e){ alert(e.message); }
+  };
+}
 
 // ===================== ICONS =====================
 const ICONS = {
@@ -185,6 +244,31 @@ function fmtSize(bytes){
   return (n/(1024*1024)).toFixed(1) + ' MB';
 }
 function currentFolder(){ return stack[stack.length-1]; }
+function sortFolders(folders){
+  return folders.slice().sort((a,b) => {
+    const ao = (a.properties && a.properties.sortOrder !== undefined) ? parseInt(a.properties.sortOrder,10) : null;
+    const bo = (b.properties && b.properties.sortOrder !== undefined) ? parseInt(b.properties.sortOrder,10) : null;
+    if(ao !== null && bo !== null) return ao - bo;
+    if(ao !== null) return -1;
+    if(bo !== null) return 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+async function reorderFolder(folderId, direction){
+  const folders = sortFolders(currentItems.filter(i => i.mimeType === FOLDER_MIME));
+  const idx = folders.findIndex(f => f.id === folderId);
+  const swapIdx = idx + direction;
+  if(idx === -1 || swapIdx < 0 || swapIdx >= folders.length) return;
+  const reordered = folders.slice();
+  const tmp = reordered[idx]; reordered[idx] = reordered[swapIdx]; reordered[swapIdx] = tmp;
+  try{
+    await Promise.all(reordered.map((f, i) => {
+      const mergedProps = Object.assign({}, f.properties || {}, { sortOrder: String(i) });
+      return apiPatchFile(f.id, { properties: mergedProps });
+    }));
+    loadAndRender();
+  }catch(e){ alert(e.message); }
+}
 
 // ===================== GOOGLE SIGN-IN (same-window redirect flow) =====================
 function redirectUri(){ return window.location.origin + window.location.pathname; }
@@ -241,8 +325,9 @@ async function checkForRedirectToken(){
 function renderAdminArea(){
   const el = document.getElementById('admin-area');
   if(adminToken){
-    el.innerHTML = `<span class="admin-chip"><span class="dot"></span>${escapeHtml(adminEmail)}</span><button class="btn btn-ghost btn-sm" id="signout-btn">Sign out</button>`;
+    el.innerHTML = `<span class="admin-chip"><span class="dot"></span>${escapeHtml(adminEmail)}</span><button class="btn btn-ghost btn-sm" id="edit-text-btn">✎ Page Text</button> <button class="btn btn-ghost btn-sm" id="signout-btn">Sign out</button>`;
     document.getElementById('signout-btn').onclick = signOut;
+    document.getElementById('edit-text-btn').onclick = openPageTextModal;
   } else {
     el.innerHTML = `<button class="btn btn-ghost btn-sm" id="signin-btn">🔒 Sign in as Admin</button>`;
     document.getElementById('signin-btn').onclick = signIn;
@@ -348,7 +433,7 @@ async function loadAndRender(){
 function renderFolderView(){
   const app = document.getElementById('app');
   const q = search.trim().toLowerCase();
-  const folders = currentItems.filter(i => i.mimeType === FOLDER_MIME && (!q || i.name.toLowerCase().includes(q)));
+  const folders = sortFolders(currentItems.filter(i => i.mimeType === FOLDER_MIME && (!q || i.name.toLowerCase().includes(q))));
   const files   = currentItems.filter(i => i.mimeType !== FOLDER_MIME && (!q || i.name.toLowerCase().includes(q)));
 
   let html = `
@@ -361,19 +446,21 @@ function renderFolderView(){
         </div>
         ${adminToken ? `
           <button class="btn btn-ghost btn-sm" id="new-folder-btn">+ Folder</button>
-          <button class="btn btn-primary btn-sm" id="upload-btn">⬆ Upload File</button>
+          <button class="btn btn-primary btn-sm" id="upload-btn">⬆ Upload Files</button>
         ` : ''}
       </div>
     </div>
   `;
 
   if(folders.length){
-    html += `<div class="folder-grid">` + folders.map(f => `
+    html += `<div class="folder-grid">` + folders.map((f, idx) => `
       <div class="folder-card" data-id="${f.id}" data-name="${escapeHtml(f.name)}">
         <span class="folder-icon">${iconFor(f.name)}</span>
         <h3 class="folder-name">${escapeHtml(f.name)}</h3>
         ${adminToken ? `
           <div class="folder-actions">
+            ${idx > 0 ? `<button class="btn-icon" data-action="move-up" data-id="${f.id}" title="Move earlier">↑</button>` : ''}
+            ${idx < folders.length-1 ? `<button class="btn-icon" data-action="move-down" data-id="${f.id}" title="Move later">↓</button>` : ''}
             <button class="btn-icon" data-action="rename-folder" data-id="${f.id}" data-name="${escapeHtml(f.name)}" title="Rename">✎</button>
             <button class="btn-icon danger" data-action="delete-folder" data-id="${f.id}" data-name="${escapeHtml(f.name)}" title="Delete">✕</button>
           </div>` : ''}
@@ -408,6 +495,8 @@ function renderFolderView(){
     const eup = document.getElementById('empty-upload-btn'); if(eup) eup.onclick = openUploadModal;
     app.querySelectorAll('[data-action="rename-folder"]').forEach(b => b.onclick = () => openRenameModal(b.getAttribute('data-id'), b.getAttribute('data-name'), true));
     app.querySelectorAll('[data-action="delete-folder"]').forEach(b => b.onclick = () => deleteFolder(b.getAttribute('data-id'), b.getAttribute('data-name')));
+    app.querySelectorAll('[data-action="move-up"]').forEach(b => b.onclick = () => reorderFolder(b.getAttribute('data-id'), -1));
+    app.querySelectorAll('[data-action="move-down"]').forEach(b => b.onclick = () => reorderFolder(b.getAttribute('data-id'), 1));
     app.querySelectorAll('[data-action="rename-file"]').forEach(b => b.onclick = () => openRenameModal(b.getAttribute('data-id'), b.getAttribute('data-name'), false));
     app.querySelectorAll('[data-action="edit-details"]').forEach(b => b.onclick = () => openDetailsModal(b.getAttribute('data-id')));
     app.querySelectorAll('[data-action="move-file"]').forEach(b => b.onclick = () => openMoveModal(b.getAttribute('data-id'), b.getAttribute('data-name')));
@@ -487,8 +576,8 @@ function openUploadModal(){
   const overlay = openModal(`
     <h3>Upload File</h3>
     <div class="file-drop">
-      Choose a file to upload into <b>${escapeHtml(currentFolder().name)}</b><br>
-      <input type="file" id="up-file">
+      Choose one or more files to upload into <b>${escapeHtml(currentFolder().name)}</b><br>
+      <input type="file" id="up-file" multiple>
     </div>
     <div id="up-progress-wrap" style="display:none;">
       <div class="progress-track"><div class="progress-fill" id="up-progress-fill"></div></div>
@@ -501,18 +590,28 @@ function openUploadModal(){
   overlay.querySelector('#up-cancel').onclick = () => overlay.remove();
   overlay.querySelector('#up-save').onclick = async () => {
     const input = overlay.querySelector('#up-file');
-    const file = input.files[0];
-    if(!file){ alert('Choose a file first.'); return; }
+    const files = Array.from(input.files || []);
+    if(!files.length){ alert('Choose at least one file.'); return; }
     overlay.querySelector('#up-progress-wrap').style.display = 'block';
     overlay.querySelector('#up-save').disabled = true;
-    try{
-      await apiUploadResumable(file, currentFolder().id, (pct) => {
-        overlay.querySelector('#up-progress-fill').style.width = pct + '%';
-        overlay.querySelector('#up-progress-label').textContent = 'Uploading… ' + pct + '%';
-      });
-      overlay.remove();
-      loadAndRender();
-    }catch(e){ alert(e.message); overlay.querySelector('#up-save').disabled = false; }
+    const fillEl = overlay.querySelector('#up-progress-fill');
+    const labelEl = overlay.querySelector('#up-progress-label');
+    let failed = [];
+    for(let i = 0; i < files.length; i++){
+      const file = files[i];
+      try{
+        await apiUploadResumable(file, currentFolder().id, (pct) => {
+          fillEl.style.width = pct + '%';
+          labelEl.textContent = `Uploading ${i+1} of ${files.length} — ${file.name} (${pct}%)`;
+        });
+      }catch(e){
+        console.error(e);
+        failed.push(file.name);
+      }
+    }
+    overlay.remove();
+    loadAndRender();
+    if(failed.length){ alert('These files failed to upload:\n' + failed.join('\n')); }
   };
 }
 
@@ -610,6 +709,7 @@ async function deleteFolder(folderId, name){
 
 // ===================== INIT =====================
 renderAdminArea();
+loadPageText();
 checkForRedirectToken().then(() => {
   history.replaceState({ stack: JSON.parse(JSON.stringify(stack)) }, '', location.pathname + location.search);
   renderAdminArea();
