@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Gemini Key Test 2</title>
+<style>
+  body{font-family:system-ui,sans-serif; max-width:700px; margin:40px auto; padding:0 20px; background:#111; color:#eee;}
+  button{background:#dda246; color:#111; border:none; padding:12px 20px; font-size:15px; border-radius:4px; cursor:pointer; font-weight:600; margin-bottom:16px;}
+  button:disabled{opacity:0.5;}
+  pre{background:#222; padding:16px; border-radius:6px; white-space:pre-wrap; word-break:break-word; font-size:12.5px; border:1px solid #444;}
+</style>
+</head>
+<body>
+<h2>Gemini Key — Isolate the Real Cause</h2>
+<p>Tests 4 variations to find exactly what triggers the auth failure. Run this from your <b>live website</b> (not a local file), since that's where the real failures happened.</p>
+<button id="run">Run all 4 tests</button>
+<pre id="out">Click the button above.</pre>
+
+<script>
+const API_KEY = 'AQ.Ab8RN6IdvdekMAVtkRICvww0RGhPyb8TkDyNzEIqYASDrbZmPw';
+const MODEL = 'gemini-3.1-flash-lite';
+
+// A tiny 1x1 red pixel PNG, base64, for the inline-data tests
+const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+async function call(label, body){
+  try{
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-goog-api-key': API_KEY },
+      body: JSON.stringify(body)
+    });
+    const text = await res.text();
+    return `${label}: ${res.ok ? '✅ OK' : '❌ FAILED'} (HTTP ${res.status})\n${text.slice(0,250)}\n`;
+  }catch(e){
+    return `${label}: ❌ NETWORK ERROR: ${e.message}\n`;
+  }
+}
+
+document.getElementById('run').onclick = async () => {
+  const out = document.getElementById('out');
+  const btn = document.getElementById('run');
+  btn.disabled = true;
+  out.textContent = 'Running (this takes a few seconds)...\n\n';
+
+  out.textContent += await call('1) Text only (baseline, known-good)', {
+    contents: [{ parts: [{ text: 'Say: Key works.' }] }]
+  });
+  out.textContent += '\n';
+
+  out.textContent += await call('2) Text + responseSchema (structured output)', {
+    contents: [{ parts: [{ text: 'List one fruit.' }] }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: { type:"object", properties:{ fruit:{type:"string"} }, required:["fruit"] } }
+  });
+  out.textContent += '\n';
+
+  out.textContent += await call('3) Text + inline image data (no schema)', {
+    contents: [{ parts: [{ text: 'What color is this image?' }, { inlineData: { mimeType: 'image/png', data: TINY_PNG } }] }]
+  });
+  out.textContent += '\n';
+
+  out.textContent += await call('4) Text + inline image + responseSchema (matches real indexing call)', {
+    contents: [{ parts: [{ text: 'What color is this image?' }, { inlineData: { mimeType: 'image/png', data: TINY_PNG } }] }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: { type:"object", properties:{ color:{type:"string"} }, required:["color"] } }
+  });
+
+  out.textContent += '\n--- Done. Copy this whole box and send it back. ---';
+  btn.disabled = false;
+};
+</script>
+</body>
+</html>
