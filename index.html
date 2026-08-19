@@ -960,16 +960,30 @@ async function handleSendChatMessage(){
   renderChatWidget();
 
   try{
-    await ensureChatIndexLoaded();
+    try{
+      await ensureChatIndexLoaded();
+    }catch(e){
+      throw new Error('STEP=load-index: ' + e.message);
+    }
     if(!chatIndex || !chatIndex.documents || !chatIndex.documents.length){
       chatMessages.push({ role:'assistant', text: 'No indexed documents yet — ask your Admin to run "Rebuild Index" first.' });
     } else {
-      const queryVector = await geminiEmbedText(question);
+      let queryVector;
+      try{
+        queryVector = await geminiEmbedText(question);
+      }catch(e){
+        throw new Error('STEP=embed-question: ' + e.message);
+      }
       const matches = retrieveRelevantChunks(queryVector, CHAT_TOP_K, chatScopedFile ? chatScopedFile.id : null);
       if(!matches.length || matches[0].score < 0.5){
         chatMessages.push({ role:'assistant', text: "I couldn't find anything specific about that in the indexed documents." });
       } else {
-        const answer = await askGeminiWithContext(question, matches);
+        let answer;
+        try{
+          answer = await askGeminiWithContext(question, matches);
+        }catch(e){
+          throw new Error('STEP=generate-answer: ' + e.message);
+        }
         const seen = new Set();
         const sources = [];
         matches.forEach(m => { if(!seen.has(m.doc.id)){ seen.add(m.doc.id); sources.push({ name: m.doc.name, link: m.doc.link }); } });
