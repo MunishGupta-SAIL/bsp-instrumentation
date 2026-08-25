@@ -7,6 +7,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.7.0/mammoth.browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
 <style>
   :root{
@@ -194,10 +197,11 @@ const ROOT_ID   = '1S-5wl8_-q7FBJ97YG7cGtmlUirnIW_6m'; // "Instrumentation Wizar
 const ROOT_NAME = 'Instrumentation Dept.';
 const SCOPES    = 'https://www.googleapis.com/auth/drive';
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
-const GEMINI_API_KEY = 'AQ.Ab8RN6IdvdekMAVtkRICvww0RGhPyb8TkDyNzEIqYASDrbZmPw';
-const CHAT_MODEL = 'gemini-3.1-flash-lite';
-const CHAT_MODEL_FALLBACK = 'gemini-3.5-flash';
-const EMBED_MODEL = 'gemini-embedding-001';
+const COHERE_API_KEY = 'cohere_NMykVfYGsmLkQLDhpyOr77PpBmyr8T9IHm0Mrbx60Rr3qM';
+const CHAT_MODEL = 'command-r7b-12-2024';
+const CHAT_MODEL_FALLBACK = 'command-a-03-2025';
+const EMBED_MODEL = 'embed-multilingual-v3.0';
+const EMBED_PROVIDER_VERSION = 'cohere-v1'; // bump this if the provider/model ever changes again, to force a full reindex
 const INDEX_FILE_NAME = '.search-index.json';
 const MAX_INLINE_FILE_SIZE = 18 * 1024 * 1024; // ~18MB safety margin for inline Gemini calls
 const CHAT_SCOPES = 'openid email profile';
@@ -531,11 +535,16 @@ async function findIndexFileId(){
 async function loadSearchIndex(){
   try{
     const id = await findIndexFileId();
-    if(!id) return { builtAt: null, documents: [] };
+    if(!id) return { builtAt: null, documents: [], embedProvider: EMBED_PROVIDER_VERSION };
     const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media&key=${API_KEY}`);
-    if(!res.ok) return { builtAt: null, documents: [] };
-    return await res.json();
-  }catch(e){ return { builtAt: null, documents: [] }; }
+    if(!res.ok) return { builtAt: null, documents: [], embedProvider: EMBED_PROVIDER_VERSION };
+    const data = await res.json();
+    if(data.embedProvider !== EMBED_PROVIDER_VERSION){
+      // The embedding model/provider changed since this index was built — old vectors aren't comparable to new ones, so start fresh.
+      return { builtAt: null, documents: [], embedProvider: EMBED_PROVIDER_VERSION };
+    }
+    return data;
+  }catch(e){ return { builtAt: null, documents: [], embedProvider: EMBED_PROVIDER_VERSION }; }
 }
 
 async function saveSearchIndex(indexObj){
@@ -576,82 +585,92 @@ function diffIndexChanges(liveFiles, indexDocuments){
   return { toProcess, toRemove, unchangedCount };
 }
 
-async function downloadFileAsBase64(fileId){
+async function downloadFileAsArrayBuffer(fileId){
   const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, { headers: authHeaders() });
   if(!res.ok) throw new Error('Download failed: HTTP ' + res.status);
-  const blob = await res.blob();
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(',')[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
+  return res.arrayBuffer();
 }
 
-async function geminiExtractChunks(base64Data, mimeType, fileName){
-  const schema = {
-    type: "object",
-    properties: {
-      chunks: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: { sectionTitle: { type: "string" }, content: { type: "string" } },
-          required: ["sectionTitle", "content"]
-        }
-      }
-    },
-    required: ["chunks"]
-  };
-  const prompt = `You are indexing a technical document from an industrial plant's instrumentation department, for a search system that people will later use to find and ask questions about it.
+// Returns extracted text, or null if this file type isn't supported yet (e.g. scanned/image content — OCR coming later)
+async function extractTextFromFile(fileId, mimeType, fileName){
+  const buf = await downloadFileAsArrayBuffer(fileId);
+
+  if(mimeType === 'application/pdf'){
+    if(window.pdfjsLib && pdfjsLib.GlobalWorkerOptions && !pdfjsLib.GlobalWorkerOptions.workerSrc){
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.js';
+    }
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    let text = '';
+    for(let i = 1; i <= pdf.numPages; i++){
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map(it => it.str).join(' ') + '\n';
+    }
+    if(text.trim().length < 30) return null; // no real text layer — likely a scanned PDF
+    return text;
+  }
+  if(mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'){
+    const result = await mammoth.extractRawText({ arrayBuffer: buf });
+    return (result.value && result.value.trim().length > 0) ? result.value : null;
+  }
+  if(mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || mimeType === 'application/vnd.ms-excel'){
+    const wb = XLSX.read(buf, { type: 'array' });
+    let text = '';
+    wb.SheetNames.forEach(name => { text += `Sheet: ${name}\n` + XLSX.utils.sheet_to_csv(wb.Sheets[name]) + '\n\n'; });
+    return text.trim().length > 0 ? text : null;
+  }
+  if(mimeType === 'text/plain' || mimeType === 'text/csv'){
+    return new TextDecoder('utf-8').decode(buf);
+  }
+  return null; // images, legacy .doc, .pptx, etc. — not yet supported (OCR/format support coming later)
+}
+
+async function chunkTextWithCohere(text, fileName){
+  const prompt = `You are indexing a technical document from an industrial plant's instrumentation department, for a search system people will later use to find and ask questions about it.
 
 Document filename: "${fileName}"
 
-Read the attached file carefully — it may be typed text or a scanned image/PDF, read it either way. Then produce a JSON breakdown for search indexing:
+Document text:
+"""
+${text.slice(0, 60000)}
+"""
 
-- If this is a short, single-topic document (a datasheet, a single certificate, a short note), return exactly ONE chunk with the full content summarized thoroughly — preserve every specific fact: numbers, tag numbers, dates, ranges, and technical specifications.
-- If this is a long, multi-section document (a manual, a technical specification, a report with distinct sections), split it into multiple chunks, one per logical section, each with a short section title and a thorough summary of that section — preserving specific facts and numbers.
+Produce a JSON breakdown for search indexing:
+- If this is a short, single-topic document, return exactly ONE chunk with the full content summarized thoroughly — preserve every specific fact: numbers, tag numbers, dates, ranges, and technical specifications.
+- If this is a long, multi-section document, split it into multiple chunks, one per logical section, each with a short section title and a thorough summary — preserving specific facts and numbers.
 
-Do not add opinions, commentary, or anything not present in the document. Only extract and summarize what is actually written or shown.`;
+Do not add opinions or anything not present in the text. Respond with ONLY raw JSON, no markdown fences, no commentary, in this exact shape: {"chunks":[{"sectionTitle":"...","content":"..."}]}`;
 
   async function callModel(modelName){
-    return fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`, {
+    const res = await fetch('https://api.cohere.com/v2/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType, data: base64Data } }] }],
-        generationConfig: { responseMimeType: "application/json", responseSchema: schema }
-      })
+      headers: { 'Authorization': 'Bearer ' + COHERE_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: modelName, messages: [{ role: 'user', content: prompt }] })
     });
+    if(!res.ok){ const t = await res.text(); throw new Error(`HTTP ${res.status}: ${t.slice(0,200)}`); }
+    return res.json();
   }
 
-  let res = await callModel(CHAT_MODEL);
-  if(!res.ok) res = await callModel(CHAT_MODEL_FALLBACK);
-  if(!res.ok){ const t = await res.text(); throw new Error(`Gemini extraction failed (HTTP ${res.status}): ${t.slice(0,200)}`); }
-  const data = await res.json();
-  const textOut = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
-  if(!textOut) throw new Error('No content returned from Gemini');
-  const parsed = JSON.parse(textOut);
+  let data;
+  try{ data = await callModel(CHAT_MODEL); }
+  catch(e){ data = await callModel(CHAT_MODEL_FALLBACK); }
+
+  const textOut = data.message && data.message.content && data.message.content.map(p => p.text).join('');
+  if(!textOut) throw new Error('No content returned from Cohere');
+  const clean = textOut.replace(/```json|```/g, '').trim();
+  const parsed = JSON.parse(clean);
   return parsed.chunks || [];
 }
 
-async function geminiEmbedText(text){
-  const body = { content: { parts: [{ text }] } };
-  let res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent`, {
+async function cohereEmbedText(text, inputType){
+  const res = await fetch('https://api.cohere.com/v1/embed', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify(Object.assign({}, body, { outputDimensionality: 768 }))
+    headers: { 'Authorization': 'Bearer ' + COHERE_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: EMBED_MODEL, texts: [text], input_type: inputType || 'search_document' })
   });
-  if(!res.ok){
-    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify(body)
-    });
-  }
   if(!res.ok){ const t = await res.text(); throw new Error(`Embedding failed (HTTP ${res.status}): ${t.slice(0,200)}`); }
   const data = await res.json();
-  return data.embedding.values;
+  return data.embeddings[0];
 }
 
 async function rebuildSearchIndex(onProgress){
@@ -676,11 +695,16 @@ async function rebuildSearchIndex(onProgress){
         skipped++;
         continue;
       }
-      const base64 = await downloadFileAsBase64(file.id);
-      const rawChunks = await geminiExtractChunks(base64, file.mimeType, file.name);
+      const text = await extractTextFromFile(file.id, file.mimeType, file.name);
+      if(!text || text.trim().length < 20){
+        documents.push({ id: file.id, name: file.name, path: file.path, link: file.webViewLink, modifiedTime: file.modifiedTime, chunks: [], skipped: 'scanned or unsupported format for now — OCR support is planned as a follow-up' });
+        skipped++;
+        continue;
+      }
+      const rawChunks = await chunkTextWithCohere(text, file.name);
       const chunksWithVectors = [];
       for(const c of rawChunks){
-        const embedding = await geminiEmbedText(`${file.name} — ${c.sectionTitle}\n${c.content}`);
+        const embedding = await cohereEmbedText(`${file.name} — ${c.sectionTitle}\n${c.content}`, 'search_document');
         chunksWithVectors.push({ sectionTitle: c.sectionTitle, content: c.content, embedding });
       }
       documents.push({ id: file.id, name: file.name, path: file.path, link: file.webViewLink, modifiedTime: file.modifiedTime, chunks: chunksWithVectors });
@@ -691,7 +715,7 @@ async function rebuildSearchIndex(onProgress){
     }
   }
 
-  const newIndex = { builtAt: Date.now(), documents };
+  const newIndex = { builtAt: Date.now(), embedProvider: EMBED_PROVIDER_VERSION, documents };
   onProgress({ phase: 'saving' });
   await saveSearchIndex(newIndex);
   onProgress({ phase: 'done', processed, skipped, failed, removed: toRemove.length, total: documents.length });
@@ -701,7 +725,7 @@ async function rebuildSearchIndex(onProgress){
 function openRebuildIndexModal(){
   const overlay = openModal(`
     <h3>Rebuild Search Index</h3>
-    <p style="color:var(--text-dim); font-size:12.5px; margin:0 0 14px;">Reads new or changed documents, summarizes them with Gemini, and saves a searchable index back to Drive. Unchanged documents are skipped automatically.</p>
+    <p style="color:var(--text-dim); font-size:12.5px; margin:0 0 14px;">Reads new or changed documents, summarizes them, and saves a searchable index back to Drive. Unchanged documents are skipped automatically. Currently supports typed PDFs, Word docs, Excel sheets, and text files — scanned/image documents are skipped for now (OCR support planned).</p>
     <div id="ri-status" class="mono" style="font-size:12px; color:var(--text-dim); white-space:pre-wrap; max-height:320px; overflow-y:auto; line-height:1.6; background:var(--bg-panel); border:1px solid var(--line); border-radius:var(--radius); padding:12px;">Ready to scan your documents.</div>
     <div class="modal-actions">
       <button class="btn btn-ghost" id="ri-close">Close</button>
@@ -811,13 +835,13 @@ function retrieveRelevantChunks(queryVector, topK, scopedFileId){
   return all.slice(0, topK);
 }
 
-// ===================== ASK GEMINI (the one function to swap once a working key exists) =====================
+// ===================== ASK COHERE (grounded answer generation) =====================
 const ADVISORY_TRIGGER_WORDS = ['suggest', 'improve', 'improvement', 'recommend', 'opinion', 'better way', 'should we'];
 function looksLikeAdvisoryRequest(text){
   const lower = text.toLowerCase();
   return ADVISORY_TRIGGER_WORDS.some(w => lower.includes(w));
 }
-async function askGeminiWithContext(question, matches){
+async function askCohereWithContext(question, matches){
   const advisory = looksLikeAdvisoryRequest(question);
   const contextBlock = matches.map((m, i) =>
     `[Source ${i+1}: ${m.doc.path ? m.doc.path + ' / ' : ''}${m.doc.name}]\n${m.chunk.sectionTitle ? m.chunk.sectionTitle + ' — ' : ''}${m.chunk.content || ''}`
@@ -830,21 +854,21 @@ async function askGeminiWithContext(question, matches){
   const prompt = `${systemInstruction}\n\nDocument excerpts:\n${contextBlock}\n\nQuestion: ${question}\n\nAnswer clearly and concisely.`;
 
   async function callModel(modelName){
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`, {
+    const res = await fetch('https://api.cohere.com/v2/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      headers: { 'Authorization': 'Bearer ' + COHERE_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: modelName, messages: [{ role: 'user', content: prompt }] })
     });
     if(!res.ok){ const t = await res.text(); throw new Error(`HTTP ${res.status}: ${t.slice(0,200)}`); }
     const data = await res.json();
-    return (data.candidates && data.candidates[0] && data.candidates[0].content.parts.map(p=>p.text).join('')) || '';
+    return (data.message && data.message.content && data.message.content.map(p=>p.text).join('')) || '';
   }
 
   try{
     return await callModel(CHAT_MODEL);
   }catch(e){
     try{ return await callModel(CHAT_MODEL_FALLBACK); }
-    catch(e2){ throw new Error('Gemini is currently unavailable: ' + e2.message); }
+    catch(e2){ throw new Error('Cohere is currently unavailable: ' + e2.message); }
   }
 }
 
@@ -970,7 +994,7 @@ async function handleSendChatMessage(){
     } else {
       let queryVector;
       try{
-        queryVector = await geminiEmbedText(question);
+        queryVector = await cohereEmbedText(question, 'search_query');
       }catch(e){
         throw new Error('STEP=embed-question: ' + e.message);
       }
@@ -980,7 +1004,7 @@ async function handleSendChatMessage(){
       } else {
         let answer;
         try{
-          answer = await askGeminiWithContext(question, matches);
+          answer = await askCohereWithContext(question, matches);
         }catch(e){
           throw new Error('STEP=generate-answer: ' + e.message);
         }
