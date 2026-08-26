@@ -7,7 +7,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.7.0/mammoth.browser.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
@@ -161,8 +160,14 @@
   .chat-msg{padding:9px 12px; border-radius:8px; font-size:13px; line-height:1.5; max-width:85%;}
   .chat-msg-user{background:var(--blue-dim); color:#fff; align-self:flex-end;}
   .chat-msg-bot{background:var(--bg-panel); border:1px solid var(--line); align-self:flex-start;}
-  .chat-sources{margin-top:8px; padding-top:8px; border-top:1px solid var(--line-soft); font-size:11px; display:flex; flex-direction:column; gap:4px;}
+  .chat-sources{margin-top:8px; padding-top:8px; border-top:1px solid var(--line-soft); font-size:11px; display:flex; flex-direction:column; gap:8px;}
   .chat-sources a{color:var(--blue);}
+  .chat-source-item{display:flex; flex-direction:column; gap:3px;}
+  .chat-source-excerpt{color:var(--text-faint); font-style:italic; font-size:10.5px; line-height:1.4; padding-left:8px; border-left:2px solid var(--line);}
+  .chat-feedback{margin-top:8px; display:flex; gap:6px;}
+  .chat-fb-btn{background:none; border:1px solid var(--line); border-radius:20px; padding:3px 8px; font-size:11px; cursor:pointer; opacity:0.6;}
+  .chat-fb-btn:hover{opacity:1; border-color:var(--blue);}
+  .chat-fb-btn.active{opacity:1; border-color:var(--amber); background:rgba(221,162,70,0.1);}
   .chat-input-row{display:flex; gap:8px; padding:12px 14px; border-top:1px solid var(--line);}
   .chat-input-row input{flex:1; background:var(--bg-panel); border:1px solid var(--line); color:var(--text); font-size:13px; padding:9px 11px; border-radius:var(--radius); outline:none;}
   .chat-input-row input:focus{border-color:var(--blue);}
@@ -201,13 +206,14 @@ const COHERE_API_KEY = 'cohere_NMykVfYGsmLkQLDhpyOr77PpBmyr8T9IHm0Mrbx60Rr3qM';
 const CHAT_MODEL = 'command-r7b-12-2024';
 const CHAT_MODEL_FALLBACK = 'command-a-03-2025';
 const EMBED_MODEL = 'embed-multilingual-v3.0';
-const EMBED_PROVIDER_VERSION = 'cohere-v1'; // bump this if the provider/model ever changes again, to force a full reindex
+const EMBED_PROVIDER_VERSION = 'cohere-v2'; // bumped: adds mimeType field + fixes pdf.js loading — forces one full reindex
 const INDEX_FILE_NAME = '.search-index.json';
 const MAX_INLINE_FILE_SIZE = 18 * 1024 * 1024; // ~18MB safety margin for inline Gemini calls
 const CHAT_SCOPES = 'openid email profile';
 const CHAT_ACCESS_FILE_NAME = '.chat-access.json';
 const CHAT_TOP_K = 6;
 const CHAT_HISTORY_TURNS = 6;
+const FEEDBACK_ENDPOINT_URL = ''; // paste your deployed Apps Script Web App URL here once created
 const CHAT_COOLDOWN_MS = 12000; // 12s between questions, per person
 
 // ===================== STATE =====================
@@ -598,12 +604,20 @@ async function downloadFileBytesPublic(fileId){
 }
 
 // Pure parser — takes raw bytes, returns extracted text or null. Used by both the admin indexing path and the public chat-time path.
+let _pdfjsLibPromise = null;
+function getPdfjsLib(){
+  if(!_pdfjsLibPromise){
+    _pdfjsLibPromise = import('https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.min.mjs').then(mod => {
+      mod.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.worker.min.mjs';
+      return mod;
+    });
+  }
+  return _pdfjsLibPromise;
+}
 function parseExtractedText(buf, mimeType){
   return (async () => {
     if(mimeType === 'application/pdf'){
-      if(window.pdfjsLib && pdfjsLib.GlobalWorkerOptions && !pdfjsLib.GlobalWorkerOptions.workerSrc){
-        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.js';
-      }
+      const pdfjsLib = await getPdfjsLib();
       const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
       let text = '';
       for(let i = 1; i <= pdf.numPages; i++){
@@ -837,14 +851,30 @@ async function ensureChatIndexLoaded(){
   if(chatIndex === null){ chatIndex = await loadSearchIndex(); }
   return chatIndex;
 }
-function retrieveRelevantChunks(queryVector, topK, scopedFileId){
+const STOPWORDS = new Set(['the','is','are','was','were','how','many','what','which','who','where','when','why','does','do','did','have','has','had','with','from','this','that','there','their','about','list','show','give','find','you','can','could','would','and','for','are','all']);
+function extractKeywords(text){
+  const words = (text || '').split(/[^A-Za-z0-9\-_]+/).filter(Boolean);
+  const keywords = new Set();
+  words.forEach(w => {
+    const lower = w.toLowerCase();
+    if(w.length >= 2 && (w === w.toUpperCase() || /\d/.test(w))){ keywords.add(lower); } // acronyms / tag numbers, e.g. BRM, PT-101
+    else if(w.length >= 4 && !STOPWORDS.has(lower)){ keywords.add(lower); }
+  });
+  return [...keywords];
+}
+function retrieveRelevantChunks(queryVector, topK, scopedFileId, queryText){
   const idx = chatIndex || { documents: [] };
+  const keywords = extractKeywords(queryText);
   const all = [];
   for(const doc of (idx.documents || [])){
     if(scopedFileId && doc.id !== scopedFileId) continue;
     for(const chunk of (doc.chunks || [])){
       if(!chunk.embedding) continue;
-      all.push({ doc, chunk, score: cosineSimilarity(queryVector, chunk.embedding) });
+      const semScore = cosineSimilarity(queryVector, chunk.embedding);
+      const haystack = ((chunk.sectionTitle||'') + ' ' + (chunk.content||'')).toLowerCase();
+      const literalHits = keywords.filter(k => haystack.includes(k)).length;
+      const score = semScore + (literalHits > 0 ? Math.min(0.15, literalHits * 0.06) : 0);
+      all.push({ doc, chunk, score, semScore, literalHits });
     }
   }
   all.sort((a,b) => b.score - a.score);
@@ -984,7 +1014,7 @@ function renderChatWidget(){
       </div>`;
   } else {
     bodyHtml = `
-      <div class="chat-messages" id="chat-messages">${chatMessages.map(chatMessageHtml).join('') || '<div class="chat-empty">Ask a question about your documents.</div>'}</div>
+      <div class="chat-messages" id="chat-messages">${chatMessages.map((m,i) => chatMessageHtml(m,i)).join('') || '<div class="chat-empty">Ask a question about your documents.</div>'}</div>
       <div class="chat-input-row">
         <input type="text" id="chat-input" placeholder="${chatScopedFile ? 'Ask about this document…' : 'Ask about your documents…'}" ${chatBusy ? 'disabled' : ''}>
         <button class="btn btn-primary btn-sm" id="chat-send-btn" ${chatBusy ? 'disabled' : ''}>${chatBusy ? '…' : 'Ask'}</button>
@@ -1015,15 +1045,53 @@ function renderChatWidget(){
   if(input){ input.onkeydown = (e) => { if(e.key === 'Enter') handleSendChatMessage(); }; input.focus(); }
   const msgsEl = document.getElementById('chat-messages');
   if(msgsEl){ msgsEl.scrollTop = msgsEl.scrollHeight; }
+  document.querySelectorAll('.chat-fb-btn').forEach(b => {
+    b.onclick = () => handleChatFeedback(parseInt(b.getAttribute('data-idx'),10), b.getAttribute('data-fb'));
+  });
 }
-function chatMessageHtml(m){
+function chatMessageHtml(m, idx){
   if(m.role === 'user'){
     return `<div class="chat-msg chat-msg-user">${escapeHtml(m.text)}</div>`;
   }
   const sourcesHtml = (m.sources && m.sources.length)
-    ? `<div class="chat-sources">${m.sources.map(s => `<a href="${escapeHtml(s.link||'#')}" target="_blank" rel="noopener">${escapeHtml(s.name)}</a>`).join(' · ')}</div>`
+    ? `<div class="chat-sources">${m.sources.map(s => `
+        <div class="chat-source-item">
+          <a href="${escapeHtml(s.link||'#')}" target="_blank" rel="noopener">${escapeHtml(s.name)}</a>
+          ${s.excerpt ? `<div class="chat-source-excerpt">"${escapeHtml(s.excerpt)}${s.excerpt.length>=220?'…':''}"</div>` : ''}
+        </div>`).join('')}</div>`
     : '';
-  return `<div class="chat-msg chat-msg-bot">${escapeHtml(m.text).replace(/\n/g,'<br>')}${sourcesHtml}</div>`;
+  const feedbackHtml = m.sources ? `
+    <div class="chat-feedback">
+      <button class="chat-fb-btn ${m.feedback==='up'?'active':''}" data-fb="up" data-idx="${idx}" title="Helpful">👍</button>
+      <button class="chat-fb-btn ${m.feedback==='down'?'active':''}" data-fb="down" data-idx="${idx}" title="Not helpful">👎</button>
+    </div>` : '';
+  return `<div class="chat-msg chat-msg-bot">${escapeHtml(m.text).replace(/\n/g,'<br>')}${sourcesHtml}${feedbackHtml}</div>`;
+}
+function handleChatFeedback(idx, value){
+  if(!chatMessages[idx]) return;
+  chatMessages[idx].feedback = chatMessages[idx].feedback === value ? null : value;
+  renderChatWidget();
+
+  if(FEEDBACK_ENDPOINT_URL && chatMessages[idx].feedback){
+    const m = chatMessages[idx];
+    const priorUser = [...chatMessages.slice(0, idx)].reverse().find(x => x.role === 'user');
+    const payload = {
+      email: chatEmail || '',
+      question: priorUser ? priorUser.text : '',
+      answer: m.text,
+      rating: m.feedback,
+      sources: (m.sources || []).map(s => s.name),
+      scopedTo: chatScopedFile ? chatScopedFile.name : ''
+    };
+    // Apps Script web apps don't reliably handle JSON + CORS preflight from arbitrary origins,
+    // so we send as text/plain (no preflight) and don't wait on/read the response — best-effort logging only.
+    fetch(FEEDBACK_ENDPOINT_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload)
+    }).catch(() => { /* feedback logging is best-effort; never disrupt the chat experience */ });
+  }
 }
 async function handleSendChatMessage(){
   const input = document.getElementById('chat-input');
@@ -1062,7 +1130,7 @@ async function handleSendChatMessage(){
       }catch(e){
         throw new Error('STEP=embed-question: ' + e.message);
       }
-      const matches = retrieveRelevantChunks(queryVector, CHAT_TOP_K, chatScopedFile ? chatScopedFile.id : null);
+      const matches = retrieveRelevantChunks(queryVector, CHAT_TOP_K, chatScopedFile ? chatScopedFile.id : null, retrievalQuery);
       if(!matches.length || matches[0].score < 0.5){
         chatMessages.push({ role:'assistant', text: "I couldn't find anything specific about that in the indexed documents." });
       } else {
@@ -1075,7 +1143,7 @@ async function handleSendChatMessage(){
         }
         const seen = new Set();
         const sources = [];
-        matches.forEach(m => { if(!seen.has(m.doc.id)){ seen.add(m.doc.id); sources.push({ name: m.doc.name, link: m.doc.link }); } });
+        matches.forEach(m => { if(!seen.has(m.doc.id)){ seen.add(m.doc.id); sources.push({ name: m.doc.name, link: m.doc.link, excerpt: (m.chunk.content || '').slice(0, 220) }); } });
         chatMessages.push({ role:'assistant', text: answer, sources });
       }
     }
