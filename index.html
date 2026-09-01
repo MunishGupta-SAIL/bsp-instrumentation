@@ -104,6 +104,10 @@
   .empty-state svg{width:30px; height:30px; margin-bottom:10px; color:var(--text-faint);}
   .empty-state p{margin:0 0 14px; font-size:13px;}
   .loading-state, .error-state{padding:50px 20px; text-align:center; color:var(--text-faint); font-family:'IBM Plex Mono', monospace; font-size:12px; letter-spacing:.04em;}
+  .access-gate{max-width:420px; margin:60px auto; text-align:center; padding:40px 24px; border:1px solid var(--line); border-radius:var(--radius); background:var(--bg-panel);}
+  .access-gate svg{width:36px; height:36px; color:var(--text-faint); margin-bottom:16px;}
+  .access-gate h2{font-family:'Oswald', sans-serif; text-transform:uppercase; font-size:19px; margin:0 0 10px; letter-spacing:.02em;}
+  .access-gate p{color:var(--text-dim); font-size:13px; line-height:1.6; margin:0 0 20px;}
   .error-state{color:var(--red);}
 
   .overlay{position:fixed; inset:0; background:rgba(10,12,14,0.72); display:flex; align-items:center; justify-content:center; padding:20px; z-index:50;}
@@ -168,6 +172,13 @@
   .chat-fb-btn{background:none; border:1px solid var(--line); border-radius:20px; padding:3px 8px; font-size:11px; cursor:pointer; opacity:0.6;}
   .chat-fb-btn:hover{opacity:1; border-color:var(--blue);}
   .chat-fb-btn.active{opacity:1; border-color:var(--amber); background:rgba(221,162,70,0.1);}
+  .chat-typing{display:flex; align-items:center; gap:8px;}
+  .chat-typing-dots{display:inline-flex; gap:3px;}
+  .chat-typing-dots span{width:6px; height:6px; border-radius:50%; background:var(--text-dim); animation:chat-bounce 1.2s infinite ease-in-out;}
+  .chat-typing-dots span:nth-child(2){animation-delay:0.15s;}
+  .chat-typing-dots span:nth-child(3){animation-delay:0.3s;}
+  @keyframes chat-bounce{0%,60%,100%{transform:translateY(0); opacity:0.5;} 30%{transform:translateY(-4px); opacity:1;}}
+  .chat-status-text{font-size:12px; color:var(--text-dim); font-style:italic;}
   .chat-input-row{display:flex; gap:8px; padding:12px 14px; border-top:1px solid var(--line);}
   .chat-input-row input{flex:1; background:var(--bg-panel); border:1px solid var(--line); color:var(--text); font-size:13px; padding:9px 11px; border-radius:var(--radius); outline:none;}
   .chat-input-row input:focus{border-color:var(--blue);}
@@ -209,8 +220,9 @@ const EMBED_MODEL = 'embed-multilingual-v3.0';
 const EMBED_PROVIDER_VERSION = 'cohere-v2'; // bumped: adds mimeType field + fixes pdf.js loading — forces one full reindex
 const INDEX_FILE_NAME = '.search-index.json';
 const MAX_INLINE_FILE_SIZE = 18 * 1024 * 1024; // ~18MB safety margin for inline Gemini calls
-const CHAT_SCOPES = 'openid email profile';
+const CHAT_SCOPES = 'https://www.googleapis.com/auth/drive.readonly openid email profile';
 const CHAT_ACCESS_FILE_NAME = '.chat-access.json';
+const VIEWER_ACCESS_FILE_NAME = '.viewer-access.json';
 const CHAT_TOP_K = 6;
 const CHAT_HISTORY_TURNS = 6;
 const FEEDBACK_ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbysCsEWsnKTlyj-oGt1-UK98O5qXNvnuMnAoNXCmmPUtJcpdi-s39EOPBWrE1IeMxhH/exec';
@@ -222,14 +234,15 @@ let search = '';
 let adminToken = null;
 let adminEmail = null;
 let currentItems = [];
-let chatToken = null;
-let chatEmail = null;
+let viewerToken = null;
+let viewerEmail = null;
 let chatAccessList = null;   // array of approved emails, null until loaded
 let chatIndex = null;        // loaded search index, null until loaded
 let chatMessages = [];       // {role:'user'|'assistant', text, sources:[]}
 let chatWidgetOpen = false;
 let chatScopedFile = null;   // {id, name} when opened from a specific document's icon
 let chatBusy = false;
+let chatStatusText = '';
 
 // ===================== EDITABLE PAGE TEXT (stored on root folder in Drive) =====================
 const DEFAULT_TEXT = {
@@ -242,9 +255,10 @@ const DEFAULT_TEXT = {
 let pageText = Object.assign({}, DEFAULT_TEXT);
 
 async function loadPageText(){
+  if(!currentReadToken()){ renderPageText(); return; } // not signed in yet — show default branding on the gate screen
   try{
-    const url = `https://www.googleapis.com/drive/v3/files/${ROOT_ID}?fields=description&key=${API_KEY}`;
-    const res = await fetch(url);
+    const url = `https://www.googleapis.com/drive/v3/files/${ROOT_ID}?fields=description`;
+    const res = await fetch(url, { headers: readHeaders() });
     if(res.ok){
       const data = await res.json();
       let saved = {};
@@ -381,10 +395,10 @@ function signIn(){
   try{ sessionStorage.setItem('bsp-chat-open', chatWidgetOpen ? '1' : '0'); }catch(e){}
   window.location.href = buildAuthUrl(SCOPES, 'admin');
 }
-function signInChat(){
+function signInViewer(){
   try{ sessionStorage.setItem('bsp-nav-stack', JSON.stringify(stack)); }catch(e){}
-  try{ sessionStorage.setItem('bsp-chat-open', '1'); }catch(e){}
-  window.location.href = buildAuthUrl(CHAT_SCOPES, 'chat');
+  try{ sessionStorage.setItem('bsp-chat-open', chatWidgetOpen ? '1' : '0'); }catch(e){}
+  window.location.href = buildAuthUrl(CHAT_SCOPES, 'viewer');
 }
 
 function signOut(){
@@ -396,10 +410,11 @@ function signOut(){
     fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(token), { method:'POST' }).catch(() => {});
   }
 }
-function signOutChat(){
-  const token = chatToken;
-  chatToken = null; chatEmail = null; chatMessages = [];
+function signOutViewer(){
+  const token = viewerToken;
+  viewerToken = null; viewerEmail = null; chatMessages = [];
   renderChatWidget();
+  loadAndRender();
   if(token){
     fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(token), { method:'POST' }).catch(() => {});
   }
@@ -423,13 +438,13 @@ async function checkForRedirectToken(){
       if(sessionStorage.getItem('bsp-chat-open') === '1'){ chatWidgetOpen = true; }
     }catch(e){}
 
-    if(state === 'chat'){
-      chatToken = token;
+    if(state === 'viewer'){
+      viewerToken = token;
       try{
-        const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers:{ Authorization:'Bearer '+chatToken } });
+        const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers:{ Authorization:'Bearer '+viewerToken } });
         const info = await r.json();
-        chatEmail = info.email || null;
-      }catch(e){ chatEmail = null; }
+        viewerEmail = info.email || null;
+      }catch(e){ viewerEmail = null; }
       renderChatWidget();
     } else {
       adminToken = token;
@@ -442,26 +457,32 @@ async function checkForRedirectToken(){
     }
   }
 }
+function currentReadToken(){ return adminToken || viewerToken || null; }
+function readHeaders(){
+  const t = currentReadToken();
+  return t ? { Authorization: 'Bearer ' + t } : {};
+}
 function renderAdminArea(){
   const el = document.getElementById('admin-area');
   if(adminToken){
-    el.innerHTML = `<span class="admin-chip"><span class="dot"></span>${escapeHtml(adminEmail)}</span><button class="btn btn-ghost btn-sm" id="edit-text-btn">✎ Page Text</button> <button class="btn btn-ghost btn-sm" id="rebuild-index-btn">⚙ Rebuild Index</button> <button class="btn btn-ghost btn-sm" id="chat-access-btn">👥 Chat Access</button> <button class="btn btn-ghost btn-sm" id="signout-btn">Sign out</button>`;
+    el.innerHTML = `<span class="admin-chip"><span class="dot"></span>${escapeHtml(adminEmail)}</span><button class="btn btn-ghost btn-sm" id="edit-text-btn">✎ Page Text</button> <button class="btn btn-ghost btn-sm" id="rebuild-index-btn">⚙ Rebuild Index</button> <button class="btn btn-ghost btn-sm" id="viewer-access-btn">👁 Viewer Access</button> <button class="btn btn-ghost btn-sm" id="chat-access-btn">💬 Chat Access</button> <button class="btn btn-ghost btn-sm" id="signout-btn">Sign out</button>`;
     document.getElementById('signout-btn').onclick = signOut;
     document.getElementById('edit-text-btn').onclick = openPageTextModal;
     document.getElementById('rebuild-index-btn').onclick = openRebuildIndexModal;
     document.getElementById('chat-access-btn').onclick = openChatAccessModal;
+    document.getElementById('viewer-access-btn').onclick = openViewerAccessModal;
   } else {
     el.innerHTML = `<button class="btn btn-ghost btn-sm" id="signin-btn">🔒 Sign in as Admin</button>`;
     document.getElementById('signin-btn').onclick = signIn;
   }
 }
 
-// ===================== DRIVE READ (public, API key) =====================
+// ===================== DRIVE READ (authenticated — respects real Drive permissions) =====================
 async function listFolder(folderId){
   const fields = encodeURIComponent('files(id,name,mimeType,modifiedTime,webViewLink,size,properties,description)');
   const q = encodeURIComponent(`'${folderId}' in parents and trashed = false`);
-  const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=${fields}&pageSize=200&orderBy=folder,name&key=${API_KEY}`;
-  const res = await fetch(url);
+  const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=${fields}&pageSize=200&orderBy=folder,name`;
+  const res = await fetch(url, { headers: readHeaders() });
   if(!res.ok){ throw new Error('Could not load folder (HTTP ' + res.status + ')'); }
   const data = await res.json();
   return data.files || [];
@@ -543,7 +564,7 @@ async function loadSearchIndex(){
   try{
     const id = await findIndexFileId();
     if(!id) return { builtAt: null, documents: [], embedProvider: EMBED_PROVIDER_VERSION };
-    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media&key=${API_KEY}`);
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`, { headers: readHeaders() });
     if(!res.ok) return { builtAt: null, documents: [], embedProvider: EMBED_PROVIDER_VERSION };
     const data = await res.json();
     if(data.embedProvider !== EMBED_PROVIDER_VERSION){
@@ -593,12 +614,7 @@ function diffIndexChanges(liveFiles, indexDocuments){
 }
 
 async function downloadFileAsArrayBuffer(fileId){
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, { headers: authHeaders() });
-  if(!res.ok) throw new Error('Download failed: HTTP ' + res.status);
-  return res.arrayBuffer();
-}
-async function downloadFileBytesPublic(fileId){
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`);
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, { headers: readHeaders() });
   if(!res.ok) throw new Error('Download failed: HTTP ' + res.status);
   return res.arrayBuffer();
 }
@@ -649,9 +665,9 @@ async function extractTextFromFile(fileId, mimeType, fileName){
   const buf = await downloadFileAsArrayBuffer(fileId);
   return parseExtractedText(buf, mimeType);
 }
-// Same, but for chat-time use by regular (non-admin) signed-in chat users — uses the public read path, no Drive edit scope needed.
+// Same as above, kept as a separate name for clarity at chat-time call sites — both now use the signed-in visitor's own authenticated read.
 async function extractTextForChat(fileId, mimeType){
-  const buf = await downloadFileBytesPublic(fileId);
+  const buf = await downloadFileAsArrayBuffer(fileId);
   return parseExtractedText(buf, mimeType);
 }
 
@@ -795,7 +811,7 @@ async function loadChatAccessList(){
   try{
     const id = await findChatAccessFileId();
     if(!id){ chatAccessList = []; return chatAccessList; }
-    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media&key=${API_KEY}`);
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`, { headers: readHeaders() });
     if(!res.ok){ chatAccessList = []; return chatAccessList; }
     const data = await res.json();
     chatAccessList = Array.isArray(data.emails) ? data.emails.map(e => e.toLowerCase().trim()) : [];
@@ -825,7 +841,7 @@ function openChatAccessModal(){
   const list = chatAccessList || [];
   const overlay = openModal(`
     <h3>Chat Access</h3>
-    <p style="color:var(--text-dim); font-size:13px; margin-top:-8px;">Only these email addresses can sign in and use the chatbot. Viewing documents stays open to everyone, unaffected by this list.</p>
+    <p style="color:var(--text-dim); font-size:13px; margin-top:-8px;">Only these email addresses can use the chatbot. This is separate from Viewer Access — someone needs to be on both lists to view documents <i>and</i> chat about them.</p>
     <div class="field"><label>Approved emails (one per line)</label><textarea id="ca-emails" rows="8">${escapeHtml(list.join('\n'))}</textarea></div>
     <div class="modal-actions">
       <button class="btn btn-ghost" id="ca-cancel">Cancel</button>
@@ -837,6 +853,114 @@ function openChatAccessModal(){
     const emails = raw.split('\n').map(s => s.trim()).filter(Boolean);
     try{ await saveChatAccessList(emails); overlay.remove(); }
     catch(e){ alert('Could not save: ' + e.message); }
+  };
+}
+
+// ===================== VIEWER ACCESS (real Google Drive permissions, not just an app-side list) =====================
+async function listDrivePermissions(){
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${ROOT_ID}/permissions?fields=permissions(id,emailAddress,type,role)`, { headers: authHeaders() });
+  if(!res.ok) throw new Error('Could not list current Drive permissions: HTTP ' + res.status);
+  const data = await res.json();
+  return data.permissions || [];
+}
+async function grantDrivePermission(email){
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${ROOT_ID}/permissions?sendNotificationEmail=false`, {
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ role: 'reader', type: 'user', emailAddress: email })
+  });
+  if(!res.ok){ const t = await res.text(); throw new Error('Could not grant access to ' + email + ': ' + t.slice(0,150)); }
+}
+async function revokeDrivePermission(permissionId){
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${ROOT_ID}/permissions/${permissionId}`, { method: 'DELETE', headers: authHeaders() });
+  if(!res.ok && res.status !== 404){ throw new Error('Could not revoke a permission: HTTP ' + res.status); }
+}
+async function findViewerAccessFileId(){
+  const items = await listFolder(ROOT_ID);
+  const found = items.find(i => i.name === VIEWER_ACCESS_FILE_NAME);
+  return found ? found.id : null;
+}
+async function loadViewerAccessList(){
+  try{
+    const id = await findViewerAccessFileId();
+    if(!id) return [];
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`, { headers: readHeaders() });
+    if(!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.emails) ? data.emails.map(e => e.toLowerCase().trim()) : [];
+  }catch(e){ return []; }
+}
+async function saveViewerAccessList(emails, onProgress){
+  const clean = [...new Set(emails.map(e => e.toLowerCase().trim()).filter(Boolean))];
+
+  onProgress && onProgress('Checking current Drive sharing…');
+  const existingPerms = await listDrivePermissions();
+
+  const anyonePerm = existingPerms.find(p => p.type === 'anyone');
+  if(anyonePerm){
+    onProgress && onProgress('Removing public "anyone with the link" access…');
+    await revokeDrivePermission(anyonePerm.id);
+  }
+
+  const existingUserPerms = existingPerms.filter(p => p.type === 'user' && p.role !== 'owner');
+  const existingEmails = new Set(existingUserPerms.map(p => (p.emailAddress||'').toLowerCase()));
+
+  for(const email of clean){
+    if(!existingEmails.has(email)){
+      onProgress && onProgress('Granting access to ' + email + '…');
+      await grantDrivePermission(email);
+    }
+  }
+  for(const perm of existingUserPerms){
+    const email = (perm.emailAddress || '').toLowerCase();
+    if(email && !clean.includes(email)){
+      onProgress && onProgress('Revoking access for ' + email + '…');
+      await revokeDrivePermission(perm.id);
+    }
+  }
+
+  onProgress && onProgress('Saving list…');
+  const blob = new Blob([JSON.stringify({ emails: clean, updated: Date.now() })], { type: 'application/json' });
+  const existingId = await findViewerAccessFileId();
+  if(existingId){
+    await fetch(`https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=media`, {
+      method: 'PATCH', headers: authHeaders({ 'Content-Type': 'application/json' }), body: blob
+    });
+  } else {
+    const metaBlob = new Blob([JSON.stringify({ name: VIEWER_ACCESS_FILE_NAME, parents: [ROOT_ID] })], { type: 'application/json' });
+    const form = new FormData();
+    form.append('metadata', metaBlob);
+    form.append('file', blob);
+    await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', { method: 'POST', headers: authHeaders(), body: form });
+  }
+}
+function openViewerAccessModal(){
+  const overlay = openModal(`
+    <h3>Viewer Access</h3>
+    <p style="color:var(--text-dim); font-size:13px; margin-top:-8px;">These people get real Google Drive access to view your documents — enforced by Google itself, not just this website. Saving also removes general "anyone with the link" sharing if it's still on, locking the folder down to just this list.</p>
+    <div class="field"><label>Approved viewer emails (one per line)</label><textarea id="va-emails" rows="8">Loading current list…</textarea></div>
+    <div id="va-status" class="mono" style="font-size:12px; color:var(--text-faint); display:none; margin-top:-6px; margin-bottom:14px;"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="va-cancel">Cancel</button>
+      <button class="btn btn-primary" id="va-save">Save &amp; Update Drive Access</button>
+    </div>`);
+  overlay.querySelector('#va-cancel').onclick = () => overlay.remove();
+  const textarea = overlay.querySelector('#va-emails');
+  loadViewerAccessList().then(list => { textarea.value = list.join('\n'); });
+
+  overlay.querySelector('#va-save').onclick = async () => {
+    const emails = textarea.value.split('\n').map(s => s.trim()).filter(Boolean);
+    const statusEl = overlay.querySelector('#va-status');
+    const saveBtn = overlay.querySelector('#va-save');
+    statusEl.style.display = 'block';
+    saveBtn.disabled = true;
+    try{
+      await saveViewerAccessList(emails, (msg) => { statusEl.textContent = msg; });
+      statusEl.textContent = 'Done — Drive access updated.';
+      setTimeout(() => overlay.remove(), 1000);
+    }catch(e){
+      statusEl.textContent = 'Error: ' + e.message;
+      saveBtn.disabled = false;
+    }
   };
 }
 
@@ -964,12 +1088,12 @@ Rules:
 // ===================== PER-PERSON COOLDOWN =====================
 function msSinceLastQuestion(){
   try{
-    const last = localStorage.getItem('bsp-chat-last-q-' + (chatEmail || 'anon'));
+    const last = localStorage.getItem('bsp-chat-last-q-' + (viewerEmail || 'anon'));
     return last ? Date.now() - parseInt(last, 10) : Infinity;
   }catch(e){ return Infinity; }
 }
 function recordQuestionTime(){
-  try{ localStorage.setItem('bsp-chat-last-q-' + (chatEmail || 'anon'), String(Date.now())); }catch(e){}
+  try{ localStorage.setItem('bsp-chat-last-q-' + (viewerEmail || 'anon'), String(Date.now())); }catch(e){}
 }
 
 // ===================== CHAT WIDGET UI =====================
@@ -997,24 +1121,29 @@ function renderChatWidget(){
   }
 
   const scopedLabel = chatScopedFile ? `<div class="chat-scoped">Asking about: <b>${escapeHtml(chatScopedFile.name)}</b> <button id="chat-unscope" class="chat-unscope-btn">✕ Ask all documents instead</button></div>` : '';
+  const currentUserEmail = adminEmail || viewerEmail;
 
   let bodyHtml;
-  if(!chatToken){
+  if(!currentReadToken()){
     bodyHtml = `
       <div class="chat-gate">
-        <p>Sign in with Google to use the assistant. Viewing documents doesn't require this — only chat does.</p>
-        <button class="btn btn-primary btn-sm" id="chat-signin-btn">Sign in to chat</button>
+        <p>Sign in with Google to view documents and use the assistant.</p>
+        <button class="btn btn-primary btn-sm" id="chat-signin-btn">Sign in</button>
       </div>`;
-  } else if(chatAccessList !== null && !chatAccessList.includes((chatEmail||'').toLowerCase())){
+  } else if(!adminToken && chatAccessList !== null && !chatAccessList.includes((currentUserEmail||'').toLowerCase())){
     bodyHtml = `
       <div class="chat-gate">
-        <p>Signed in as <b>${escapeHtml(chatEmail)}</b>, but this account isn't approved for chat access yet.</p>
+        <p>Signed in as <b>${escapeHtml(currentUserEmail)}</b>, but this account isn't approved for chat access yet.</p>
         <p style="color:var(--text-faint); font-size:12px;">Contact your Admin to be added.</p>
         <button class="btn btn-ghost btn-sm" id="chat-signout-btn">Sign out</button>
       </div>`;
   } else {
     bodyHtml = `
-      <div class="chat-messages" id="chat-messages">${chatMessages.map((m,i) => chatMessageHtml(m,i)).join('') || '<div class="chat-empty">Ask a question about your documents.</div>'}</div>
+      <div class="chat-messages" id="chat-messages">${chatMessages.map((m,i) => chatMessageHtml(m,i)).join('') || '<div class="chat-empty">Ask a question about your documents.</div>'}${chatBusy ? `
+        <div class="chat-msg chat-msg-bot chat-typing">
+          <span class="chat-typing-dots"><span></span><span></span><span></span></span>
+          <span class="chat-status-text">${escapeHtml(chatStatusText || 'Thinking…')}</span>
+        </div>` : ''}</div>
       <div class="chat-input-row">
         <input type="text" id="chat-input" placeholder="${chatScopedFile ? 'Ask about this document…' : 'Ask about your documents…'}" ${chatBusy ? 'disabled' : ''}>
         <button class="btn btn-primary btn-sm" id="chat-send-btn" ${chatBusy ? 'disabled' : ''}>${chatBusy ? '…' : 'Ask'}</button>
@@ -1026,7 +1155,7 @@ function renderChatWidget(){
       <div class="chat-header">
         <span>💬 Ask About These Documents</span>
         <div>
-          ${chatToken ? `<span class="chat-header-email">${escapeHtml(chatEmail||'')}</span> <button class="chat-icon-btn" id="chat-signout-header">Sign out</button>` : ''}
+          ${viewerToken ? `<span class="chat-header-email">${escapeHtml(viewerEmail||'')}</span> <button class="chat-icon-btn" id="chat-signout-header">Sign out</button>` : ''}
           <button class="chat-icon-btn" id="chat-close-btn">✕</button>
         </div>
       </div>
@@ -1035,9 +1164,9 @@ function renderChatWidget(){
     </div>`;
 
   document.getElementById('chat-close-btn').onclick = closeChatWidget;
-  const signinBtn = document.getElementById('chat-signin-btn'); if(signinBtn) signinBtn.onclick = signInChat;
-  const signoutBtn = document.getElementById('chat-signout-btn'); if(signoutBtn) signoutBtn.onclick = signOutChat;
-  const signoutHeader = document.getElementById('chat-signout-header'); if(signoutHeader) signoutHeader.onclick = signOutChat;
+  const signinBtn = document.getElementById('chat-signin-btn'); if(signinBtn) signinBtn.onclick = signInViewer;
+  const signoutBtn = document.getElementById('chat-signout-btn'); if(signoutBtn) signoutBtn.onclick = signOutViewer;
+  const signoutHeader = document.getElementById('chat-signout-header'); if(signoutHeader) signoutHeader.onclick = signOutViewer;
   const unscopeBtn = document.getElementById('chat-unscope'); if(unscopeBtn) unscopeBtn.onclick = () => { chatScopedFile = null; renderChatWidget(); };
   const sendBtn = document.getElementById('chat-send-btn');
   const input = document.getElementById('chat-input');
@@ -1076,7 +1205,7 @@ function handleChatFeedback(idx, value){
     const m = chatMessages[idx];
     const priorUser = [...chatMessages.slice(0, idx)].reverse().find(x => x.role === 'user');
     const payload = {
-      email: chatEmail || '',
+      email: viewerEmail || '',
       question: priorUser ? priorUser.text : '',
       answer: m.text,
       rating: m.feedback,
@@ -1109,6 +1238,7 @@ async function handleSendChatMessage(){
   chatMessages.push({ role:'user', text: question });
   input.value = '';
   chatBusy = true;
+  chatStatusText = 'Loading document index…';
   renderChatWidget();
 
   try{
@@ -1124,6 +1254,8 @@ async function handleSendChatMessage(){
       const lastAssistant = [...recentHistory].reverse().find(h => h.role === 'assistant');
       const retrievalQuery = lastAssistant ? `${lastAssistant.text}\n${question}` : question;
 
+      chatStatusText = 'Understanding your question…';
+      renderChatWidget();
       let queryVector;
       try{
         queryVector = await cohereEmbedText(retrievalQuery, 'search_query');
@@ -1134,7 +1266,11 @@ async function handleSendChatMessage(){
       if(!matches.length || matches[0].score < 0.5){
         chatMessages.push({ role:'assistant', text: "I couldn't find anything specific about that in the indexed documents." });
       } else {
+        chatStatusText = 'Reading the most relevant documents…';
+        renderChatWidget();
         const fullTextBlocks = await fetchTopDocsFullText(matches);
+        chatStatusText = 'Writing an answer…';
+        renderChatWidget();
         let answer;
         try{
           answer = await askCohereWithContext(question, matches, fullTextBlocks, recentHistory);
@@ -1152,6 +1288,7 @@ async function handleSendChatMessage(){
     chatMessages.push({ role:'assistant', text: 'Sorry, something went wrong answering that: ' + e.message });
   }
   chatBusy = false;
+  chatStatusText = '';
   renderChatWidget();
 }
 
@@ -1186,13 +1323,29 @@ function renderCrumbs(){
 async function loadAndRender(){
   renderCrumbs();
   const app = document.getElementById('app');
+
+  if(!currentReadToken()){
+    app.innerHTML = `
+      <div class="access-gate">
+        ${ICONS.folder}
+        <h2>Sign in to view these documents</h2>
+        <p>This department portal is restricted to approved people. Sign in with the Google account your Admin has granted access to.</p>
+        <button class="btn btn-primary" id="gate-signin-btn">🔒 Sign in to view</button>
+      </div>`;
+    document.getElementById('gate-signin-btn').onclick = signInViewer;
+    return;
+  }
+
   app.innerHTML = `<div class="loading-state">LOADING FROM GOOGLE DRIVE…</div>`;
   try{
     currentItems = await listFolder(currentFolder().id);
     renderFolderView();
   }catch(err){
     console.error(err);
-    app.innerHTML = `<div class="error-state">Could not load this folder from Google Drive.<br>${escapeHtml(err.message)}<br><br><button class="btn btn-ghost btn-sm" onclick="loadAndRender()">Retry</button></div>`;
+    const isPermissionError = err.message.includes('403') || err.message.includes('404');
+    app.innerHTML = `<div class="error-state">${isPermissionError
+      ? 'Your account doesn\'t have access to view this folder. Contact your Admin to be added to the Viewer list.'
+      : 'Could not load this folder from Google Drive.<br>' + escapeHtml(err.message)}<br><br><button class="btn btn-ghost btn-sm" onclick="loadAndRender()">Retry</button></div>`;
   }
 }
 
