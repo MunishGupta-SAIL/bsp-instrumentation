@@ -153,6 +153,14 @@
   .chat-header-email{font-family:'IBM Plex Mono', monospace; font-size:10.5px; color:var(--text-faint); margin-right:6px;}
   .chat-icon-btn{background:none; border:none; color:var(--text-dim); cursor:pointer; font-size:12px; padding:2px 6px;}
   .chat-icon-btn:hover{color:var(--text);}
+  .chat-mode-toggle{display:flex; border-bottom:1px solid var(--line);}
+  .chat-mode-btn{flex:1; background:none; border:none; color:var(--text-faint); padding:10px; font-size:12.5px; font-weight:600; cursor:pointer; border-bottom:2px solid transparent;}
+  .chat-mode-btn.active{color:var(--amber); border-bottom-color:var(--amber);}
+  .chat-mode-btn:hover:not(.active){color:var(--text-dim);}
+  .chat-suggest{padding:14px; flex:1; display:flex; flex-direction:column;}
+  .chat-suggest textarea{width:100%; background:var(--bg-panel); border:1px solid var(--line); color:var(--text); font-size:13px; padding:9px 11px; border-radius:var(--radius); outline:none; resize:vertical; font-family:inherit;}
+  .chat-suggest textarea:focus{border-color:var(--blue);}
+  .chat-suggest-status{margin-top:8px; font-size:12px; color:var(--green); text-align:center;}
   .chat-scoped{
     font-size:11.5px; color:var(--text-dim); padding:8px 14px; border-bottom:1px solid var(--line-soft);
     background:var(--bg-panel-alt); display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
@@ -226,6 +234,7 @@ const VIEWER_ACCESS_FILE_NAME = '.viewer-access.json';
 const CHAT_TOP_K = 6;
 const CHAT_HISTORY_TURNS = 6;
 const FEEDBACK_ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbysCsEWsnKTlyj-oGt1-UK98O5qXNvnuMnAoNXCmmPUtJcpdi-s39EOPBWrE1IeMxhH/exec';
+const CORE_ACCESS_FILE_NAME = '.core-group-access.json';
 const CHAT_COOLDOWN_MS = 12000; // 12s between questions, per person
 
 // ===================== STATE =====================
@@ -234,6 +243,8 @@ let search = '';
 let adminToken = null;
 let adminEmail = null;
 let currentItems = [];
+let coreToken = null;
+let coreEmail = null;
 let viewerToken = null;
 let viewerEmail = null;
 let chatAccessList = null;   // array of approved emails, null until loaded
@@ -243,6 +254,8 @@ let chatWidgetOpen = false;
 let chatScopedFile = null;   // {id, name} when opened from a specific document's icon
 let chatBusy = false;
 let chatStatusText = '';
+let widgetMode = 'ask'; // 'ask' or 'suggest'
+let suggestStatus = '';
 
 // ===================== EDITABLE PAGE TEXT (stored on root folder in Drive) =====================
 const DEFAULT_TEXT = {
@@ -395,6 +408,11 @@ function signIn(){
   try{ sessionStorage.setItem('bsp-chat-open', chatWidgetOpen ? '1' : '0'); }catch(e){}
   window.location.href = buildAuthUrl(SCOPES, 'admin');
 }
+function signInCore(){
+  try{ sessionStorage.setItem('bsp-nav-stack', JSON.stringify(stack)); }catch(e){}
+  try{ sessionStorage.setItem('bsp-chat-open', chatWidgetOpen ? '1' : '0'); }catch(e){}
+  window.location.href = buildAuthUrl(SCOPES, 'core');
+}
 function signInViewer(){
   try{ sessionStorage.setItem('bsp-nav-stack', JSON.stringify(stack)); }catch(e){}
   try{ sessionStorage.setItem('bsp-chat-open', chatWidgetOpen ? '1' : '0'); }catch(e){}
@@ -404,6 +422,15 @@ function signInViewer(){
 function signOut(){
   const token = adminToken;
   adminToken = null; adminEmail = null;
+  renderAdminArea();
+  loadAndRender();
+  if(token){
+    fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(token), { method:'POST' }).catch(() => {});
+  }
+}
+function signOutCore(){
+  const token = coreToken;
+  coreToken = null; coreEmail = null;
   renderAdminArea();
   loadAndRender();
   if(token){
@@ -446,6 +473,14 @@ async function checkForRedirectToken(){
         viewerEmail = info.email || null;
       }catch(e){ viewerEmail = null; }
       renderChatWidget();
+    } else if(state === 'core'){
+      coreToken = token;
+      try{
+        const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers:{ Authorization:'Bearer '+coreToken } });
+        const info = await r.json();
+        coreEmail = info.email || 'Core Group';
+      }catch(e){ coreEmail = 'Core Group'; }
+      renderAdminArea();
     } else {
       adminToken = token;
       try{
@@ -457,7 +492,8 @@ async function checkForRedirectToken(){
     }
   }
 }
-function currentReadToken(){ return adminToken || viewerToken || null; }
+function currentReadToken(){ return adminToken || coreToken || viewerToken || null; }
+function currentWriteToken(){ return adminToken || coreToken || null; }
 function readHeaders(){
   const t = currentReadToken();
   return t ? { Authorization: 'Bearer ' + t } : {};
@@ -465,15 +501,20 @@ function readHeaders(){
 function renderAdminArea(){
   const el = document.getElementById('admin-area');
   if(adminToken){
-    el.innerHTML = `<span class="admin-chip"><span class="dot"></span>${escapeHtml(adminEmail)}</span><button class="btn btn-ghost btn-sm" id="edit-text-btn">✎ Page Text</button> <button class="btn btn-ghost btn-sm" id="rebuild-index-btn">⚙ Rebuild Index</button> <button class="btn btn-ghost btn-sm" id="viewer-access-btn">👁 Viewer Access</button> <button class="btn btn-ghost btn-sm" id="chat-access-btn">💬 Chat Access</button> <button class="btn btn-ghost btn-sm" id="signout-btn">Sign out</button>`;
+    el.innerHTML = `<span class="admin-chip"><span class="dot"></span>${escapeHtml(adminEmail)} · Admin</span><button class="btn btn-ghost btn-sm" id="edit-text-btn">✎ Page Text</button> <button class="btn btn-ghost btn-sm" id="rebuild-index-btn">⚙ Rebuild Index</button> <button class="btn btn-ghost btn-sm" id="core-access-btn">🛠 Core Group Access</button> <button class="btn btn-ghost btn-sm" id="viewer-access-btn">👁 Viewer Access</button> <button class="btn btn-ghost btn-sm" id="chat-access-btn">💬 Chat Access</button> <button class="btn btn-ghost btn-sm" id="signout-btn">Sign out</button>`;
     document.getElementById('signout-btn').onclick = signOut;
     document.getElementById('edit-text-btn').onclick = openPageTextModal;
     document.getElementById('rebuild-index-btn').onclick = openRebuildIndexModal;
     document.getElementById('chat-access-btn').onclick = openChatAccessModal;
     document.getElementById('viewer-access-btn').onclick = openViewerAccessModal;
+    document.getElementById('core-access-btn').onclick = openCoreAccessModal;
+  } else if(coreToken){
+    el.innerHTML = `<span class="admin-chip"><span class="dot"></span>${escapeHtml(coreEmail)} · Core Group</span><button class="btn btn-ghost btn-sm" id="signout-btn">Sign out</button>`;
+    document.getElementById('signout-btn').onclick = signOutCore;
   } else {
-    el.innerHTML = `<button class="btn btn-ghost btn-sm" id="signin-btn">🔒 Sign in as Admin</button>`;
+    el.innerHTML = `<button class="btn btn-ghost btn-sm" id="signin-core-btn">🛠 Core Group Sign In</button> <button class="btn btn-ghost btn-sm" id="signin-btn">🔒 Sign in as Admin</button>`;
     document.getElementById('signin-btn').onclick = signIn;
+    document.getElementById('signin-core-btn').onclick = signInCore;
   }
 }
 
@@ -489,7 +530,7 @@ async function listFolder(folderId){
 }
 
 // ===================== DRIVE WRITE (admin, OAuth) =====================
-function authHeaders(extra){ return Object.assign({ 'Authorization': 'Bearer ' + adminToken }, extra || {}); }
+function authHeaders(extra){ return Object.assign({ 'Authorization': 'Bearer ' + currentWriteToken() }, extra || {}); }
 
 async function apiCreateFolder(name, parentId){
   const res = await fetch('https://www.googleapis.com/drive/v3/files', {
@@ -808,6 +849,7 @@ async function findChatAccessFileId(){
   return found ? found.id : null;
 }
 async function loadChatAccessList(){
+  if(!currentReadToken()){ return chatAccessList; } // not signed in yet — don't waste a doomed request, leave as null
   try{
     const id = await findChatAccessFileId();
     if(!id){ chatAccessList = []; return chatAccessList; }
@@ -863,16 +905,24 @@ async function listDrivePermissions(){
   const data = await res.json();
   return data.permissions || [];
 }
-async function grantDrivePermission(email){
+async function grantDrivePermission(email, role){
   const res = await fetch(`https://www.googleapis.com/drive/v3/files/${ROOT_ID}/permissions?sendNotificationEmail=false`, {
     method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ role: 'reader', type: 'user', emailAddress: email })
+    body: JSON.stringify({ role: role || 'reader', type: 'user', emailAddress: email })
   });
   if(!res.ok){ const t = await res.text(); throw new Error('Could not grant access to ' + email + ': ' + t.slice(0,150)); }
 }
 async function revokeDrivePermission(permissionId){
   const res = await fetch(`https://www.googleapis.com/drive/v3/files/${ROOT_ID}/permissions/${permissionId}`, { method: 'DELETE', headers: authHeaders() });
   if(!res.ok && res.status !== 404){ throw new Error('Could not revoke a permission: HTTP ' + res.status); }
+}
+// Prevents Core Group (Editor-role) members from re-sharing or changing access themselves via Drive's own UI —
+// closes the gap that would otherwise make "only Admin manages access lists" purely cosmetic.
+async function lockWritersFromSharing(){
+  await fetch(`https://www.googleapis.com/drive/v3/files/${ROOT_ID}?fields=id`, {
+    method: 'PATCH', headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ writersCanShare: false })
+  });
 }
 async function findViewerAccessFileId(){
   const items = await listFolder(ROOT_ID);
@@ -901,13 +951,14 @@ async function saveViewerAccessList(emails, onProgress){
     await revokeDrivePermission(anyonePerm.id);
   }
 
-  const existingUserPerms = existingPerms.filter(p => p.type === 'user' && p.role !== 'owner');
+  // Only touch reader-role permissions here — writer-role (Core Group) is managed separately and must not be disturbed.
+  const existingUserPerms = existingPerms.filter(p => p.type === 'user' && p.role === 'reader');
   const existingEmails = new Set(existingUserPerms.map(p => (p.emailAddress||'').toLowerCase()));
 
   for(const email of clean){
     if(!existingEmails.has(email)){
       onProgress && onProgress('Granting access to ' + email + '…');
-      await grantDrivePermission(email);
+      await grantDrivePermission(email, 'reader');
     }
   }
   for(const perm of existingUserPerms){
@@ -932,6 +983,95 @@ async function saveViewerAccessList(emails, onProgress){
     form.append('file', blob);
     await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', { method: 'POST', headers: authHeaders(), body: form });
   }
+}
+
+// ===================== CORE GROUP ACCESS (real Drive Editor permission — full write parity) =====================
+async function findCoreAccessFileId(){
+  const items = await listFolder(ROOT_ID);
+  const found = items.find(i => i.name === CORE_ACCESS_FILE_NAME);
+  return found ? found.id : null;
+}
+async function loadCoreAccessList(){
+  try{
+    const id = await findCoreAccessFileId();
+    if(!id) return [];
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`, { headers: readHeaders() });
+    if(!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.emails) ? data.emails.map(e => e.toLowerCase().trim()) : [];
+  }catch(e){ return []; }
+}
+async function saveCoreGroupList(emails, onProgress){
+  const clean = [...new Set(emails.map(e => e.toLowerCase().trim()).filter(Boolean))];
+
+  onProgress && onProgress('Checking current Drive sharing…');
+  const existingPerms = await listDrivePermissions();
+
+  // Only touch writer-role permissions here — reader-role (Viewer Access) is managed separately.
+  const existingUserPerms = existingPerms.filter(p => p.type === 'user' && p.role === 'writer');
+  const existingEmails = new Set(existingUserPerms.map(p => (p.emailAddress||'').toLowerCase()));
+
+  for(const email of clean){
+    if(!existingEmails.has(email)){
+      onProgress && onProgress('Granting edit access to ' + email + '…');
+      await grantDrivePermission(email, 'writer');
+    }
+  }
+  for(const perm of existingUserPerms){
+    const email = (perm.emailAddress || '').toLowerCase();
+    if(email && !clean.includes(email)){
+      onProgress && onProgress('Revoking edit access for ' + email + '…');
+      await revokeDrivePermission(perm.id);
+    }
+  }
+
+  onProgress && onProgress('Locking down sharing permissions…');
+  await lockWritersFromSharing();
+
+  onProgress && onProgress('Saving list…');
+  const blob = new Blob([JSON.stringify({ emails: clean, updated: Date.now() })], { type: 'application/json' });
+  const existingId = await findCoreAccessFileId();
+  if(existingId){
+    await fetch(`https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=media`, {
+      method: 'PATCH', headers: authHeaders({ 'Content-Type': 'application/json' }), body: blob
+    });
+  } else {
+    const metaBlob = new Blob([JSON.stringify({ name: CORE_ACCESS_FILE_NAME, parents: [ROOT_ID] })], { type: 'application/json' });
+    const form = new FormData();
+    form.append('metadata', metaBlob);
+    form.append('file', blob);
+    await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', { method: 'POST', headers: authHeaders(), body: form });
+  }
+}
+function openCoreAccessModal(){
+  const overlay = openModal(`
+    <h3>Core Group Access</h3>
+    <p style="color:var(--text-dim); font-size:13px; margin-top:-8px;">These people get real Google Drive <b>Editor</b> access — they can upload, rename, move, delete and reorder, same as you, except they can't manage access lists, rebuild the search index, or edit page text. Only you (Admin) can change this list.</p>
+    <div class="field"><label>Core Group emails (one per line)</label><textarea id="cga-emails" rows="8">Loading current list…</textarea></div>
+    <div id="cga-status" class="mono" style="font-size:12px; color:var(--text-faint); display:none; margin-top:-6px; margin-bottom:14px;"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="cga-cancel">Cancel</button>
+      <button class="btn btn-primary" id="cga-save">Save &amp; Update Drive Access</button>
+    </div>`);
+  overlay.querySelector('#cga-cancel').onclick = () => overlay.remove();
+  const textarea = overlay.querySelector('#cga-emails');
+  loadCoreAccessList().then(list => { textarea.value = list.join('\n'); });
+
+  overlay.querySelector('#cga-save').onclick = async () => {
+    const emails = textarea.value.split('\n').map(s => s.trim()).filter(Boolean);
+    const statusEl = overlay.querySelector('#cga-status');
+    const saveBtn = overlay.querySelector('#cga-save');
+    statusEl.style.display = 'block';
+    saveBtn.disabled = true;
+    try{
+      await saveCoreGroupList(emails, (msg) => { statusEl.textContent = msg; });
+      statusEl.textContent = 'Done — Drive access updated.';
+      setTimeout(() => overlay.remove(), 1000);
+    }catch(e){
+      statusEl.textContent = 'Error: ' + e.message;
+      saveBtn.disabled = false;
+    }
+  };
 }
 function openViewerAccessModal(){
   const overlay = openModal(`
@@ -1120,42 +1260,60 @@ function renderChatWidget(){
     return;
   }
 
-  const scopedLabel = chatScopedFile ? `<div class="chat-scoped">Asking about: <b>${escapeHtml(chatScopedFile.name)}</b> <button id="chat-unscope" class="chat-unscope-btn">✕ Ask all documents instead</button></div>` : '';
-  const currentUserEmail = adminEmail || viewerEmail;
+  const scopedLabel = chatScopedFile ? `<div class="chat-scoped">About: <b>${escapeHtml(chatScopedFile.name)}</b> <button id="chat-unscope" class="chat-unscope-btn">✕ Use all documents instead</button></div>` : '';
+  const currentUserEmail = adminEmail || coreEmail || viewerEmail;
+  const isChatApproved = !!adminToken || !!coreToken || (chatAccessList !== null && chatAccessList.includes((currentUserEmail||'').toLowerCase()));
 
   let bodyHtml;
   if(!currentReadToken()){
     bodyHtml = `
       <div class="chat-gate">
-        <p>Sign in with Google to view documents and use the assistant.</p>
+        <p>Sign in with Google to view documents, ask questions, or send a suggestion.</p>
         <button class="btn btn-primary btn-sm" id="chat-signin-btn">Sign in</button>
       </div>`;
-  } else if(!adminToken && chatAccessList !== null && !chatAccessList.includes((currentUserEmail||'').toLowerCase())){
-    bodyHtml = `
-      <div class="chat-gate">
-        <p>Signed in as <b>${escapeHtml(currentUserEmail)}</b>, but this account isn't approved for chat access yet.</p>
-        <p style="color:var(--text-faint); font-size:12px;">Contact your Admin to be added.</p>
-        <button class="btn btn-ghost btn-sm" id="chat-signout-btn">Sign out</button>
-      </div>`;
   } else {
-    bodyHtml = `
-      <div class="chat-messages" id="chat-messages">${chatMessages.map((m,i) => chatMessageHtml(m,i)).join('') || '<div class="chat-empty">Ask a question about your documents.</div>'}${chatBusy ? `
-        <div class="chat-msg chat-msg-bot chat-typing">
-          <span class="chat-typing-dots"><span></span><span></span><span></span></span>
-          <span class="chat-status-text">${escapeHtml(chatStatusText || 'Thinking…')}</span>
-        </div>` : ''}</div>
-      <div class="chat-input-row">
-        <input type="text" id="chat-input" placeholder="${chatScopedFile ? 'Ask about this document…' : 'Ask about your documents…'}" ${chatBusy ? 'disabled' : ''}>
-        <button class="btn btn-primary btn-sm" id="chat-send-btn" ${chatBusy ? 'disabled' : ''}>${chatBusy ? '…' : 'Ask'}</button>
+    const modeToggle = `
+      <div class="chat-mode-toggle">
+        <button class="chat-mode-btn ${widgetMode==='ask'?'active':''}" id="mode-ask-btn">💬 Ask</button>
+        <button class="chat-mode-btn ${widgetMode==='suggest'?'active':''}" id="mode-suggest-btn">💡 Suggest</button>
       </div>`;
+
+    let modeBodyHtml;
+    if(widgetMode === 'suggest'){
+      modeBodyHtml = `
+        <div class="chat-suggest">
+          <p style="color:var(--text-dim); font-size:12.5px; margin:0 0 10px;">Send a suggestion, correction, or request to Admin and Core Group${chatScopedFile ? ' about this document' : ''}.</p>
+          <textarea id="suggest-input" rows="4" placeholder="e.g. This drawing looks outdated, or please add the manual for..." ${chatBusy ? 'disabled' : ''}></textarea>
+          <button class="btn btn-primary btn-sm" id="suggest-send-btn" ${chatBusy ? 'disabled' : ''} style="margin-top:8px; width:100%;">${chatBusy ? 'Sending…' : 'Send Suggestion'}</button>
+          ${suggestStatus ? `<div class="chat-suggest-status">${escapeHtml(suggestStatus)}</div>` : ''}
+        </div>`;
+    } else if(!isChatApproved){
+      modeBodyHtml = `
+        <div class="chat-gate">
+          <p>Signed in as <b>${escapeHtml(currentUserEmail)}</b>, but this account isn't approved for chat access yet.</p>
+          <p style="color:var(--text-faint); font-size:12px;">You can still send a suggestion using the tab above. Contact your Admin to be added for chat.</p>
+        </div>`;
+    } else {
+      modeBodyHtml = `
+        <div class="chat-messages" id="chat-messages">${chatMessages.map((m,i) => chatMessageHtml(m,i)).join('') || '<div class="chat-empty">Ask a question about your documents.</div>'}${chatBusy ? `
+          <div class="chat-msg chat-msg-bot chat-typing">
+            <span class="chat-typing-dots"><span></span><span></span><span></span></span>
+            <span class="chat-status-text">${escapeHtml(chatStatusText || 'Thinking…')}</span>
+          </div>` : ''}</div>
+        <div class="chat-input-row">
+          <input type="text" id="chat-input" placeholder="${chatScopedFile ? 'Ask about this document…' : 'Ask about your documents…'}" ${chatBusy ? 'disabled' : ''}>
+          <button class="btn btn-primary btn-sm" id="chat-send-btn" ${chatBusy ? 'disabled' : ''}>${chatBusy ? '…' : 'Ask'}</button>
+        </div>`;
+    }
+    bodyHtml = modeToggle + modeBodyHtml;
   }
 
   el.innerHTML = `
     <div class="chat-panel">
       <div class="chat-header">
-        <span>💬 Ask About These Documents</span>
+        <span>💬 Ask &amp; Suggest</span>
         <div>
-          ${viewerToken ? `<span class="chat-header-email">${escapeHtml(viewerEmail||'')}</span> <button class="chat-icon-btn" id="chat-signout-header">Sign out</button>` : ''}
+          ${(viewerToken && !adminToken && !coreToken) ? `<span class="chat-header-email">${escapeHtml(viewerEmail||'')}</span> <button class="chat-icon-btn" id="chat-signout-header">Sign out</button>` : ''}
           <button class="chat-icon-btn" id="chat-close-btn">✕</button>
         </div>
       </div>
@@ -1165,8 +1323,10 @@ function renderChatWidget(){
 
   document.getElementById('chat-close-btn').onclick = closeChatWidget;
   const signinBtn = document.getElementById('chat-signin-btn'); if(signinBtn) signinBtn.onclick = signInViewer;
-  const signoutBtn = document.getElementById('chat-signout-btn'); if(signoutBtn) signoutBtn.onclick = signOutViewer;
   const signoutHeader = document.getElementById('chat-signout-header'); if(signoutHeader) signoutHeader.onclick = signOutViewer;
+  const modeAskBtn = document.getElementById('mode-ask-btn'); if(modeAskBtn) modeAskBtn.onclick = () => { widgetMode = 'ask'; renderChatWidget(); };
+  const modeSuggestBtn = document.getElementById('mode-suggest-btn'); if(modeSuggestBtn) modeSuggestBtn.onclick = () => { widgetMode = 'suggest'; renderChatWidget(); };
+  const suggestBtn = document.getElementById('suggest-send-btn'); if(suggestBtn) suggestBtn.onclick = handleSendSuggestion;
   const unscopeBtn = document.getElementById('chat-unscope'); if(unscopeBtn) unscopeBtn.onclick = () => { chatScopedFile = null; renderChatWidget(); };
   const sendBtn = document.getElementById('chat-send-btn');
   const input = document.getElementById('chat-input');
@@ -1205,7 +1365,7 @@ function handleChatFeedback(idx, value){
     const m = chatMessages[idx];
     const priorUser = [...chatMessages.slice(0, idx)].reverse().find(x => x.role === 'user');
     const payload = {
-      email: viewerEmail || '',
+      email: adminEmail || coreEmail || viewerEmail || '',
       question: priorUser ? priorUser.text : '',
       answer: m.text,
       rating: m.feedback,
@@ -1221,6 +1381,40 @@ function handleChatFeedback(idx, value){
       body: JSON.stringify(payload)
     }).catch(() => { /* feedback logging is best-effort; never disrupt the chat experience */ });
   }
+}
+async function handleSendSuggestion(){
+  const textarea = document.getElementById('suggest-input');
+  const text = (textarea && textarea.value || '').trim();
+  if(!text || chatBusy) return;
+
+  const currentUserEmail = adminEmail || coreEmail || viewerEmail || '';
+  chatBusy = true;
+  suggestStatus = '';
+  renderChatWidget();
+
+  const payload = {
+    kind: 'suggestion',
+    email: currentUserEmail,
+    text: text,
+    scopedTo: chatScopedFile ? chatScopedFile.name : ''
+  };
+
+  try{
+    if(FEEDBACK_ENDPOINT_URL){
+      await fetch(FEEDBACK_ENDPOINT_URL, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload)
+      });
+    }
+    suggestStatus = 'Sent — thank you.';
+  }catch(e){
+    suggestStatus = 'Could not send just now — please try again.';
+  }
+  chatBusy = false;
+  renderChatWidget();
+  setTimeout(() => { suggestStatus = ''; renderChatWidget(); }, 4000);
 }
 async function handleSendChatMessage(){
   const input = document.getElementById('chat-input');
@@ -1364,7 +1558,7 @@ function renderFolderView(){
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
           <input type="text" id="search-input" placeholder="Search here…" value="${escapeHtml(search)}">
         </div>
-        ${adminToken ? `
+        ${currentWriteToken() ? `
           <button class="btn btn-ghost btn-sm" id="new-folder-btn">+ Folder</button>
           <button class="btn btn-primary btn-sm" id="upload-btn">⬆ Upload Files</button>
         ` : ''}
@@ -1377,7 +1571,7 @@ function renderFolderView(){
       <div class="folder-card" data-id="${f.id}" data-name="${escapeHtml(f.name)}">
         <span class="folder-icon">${iconFor(f.name)}</span>
         <h3 class="folder-name">${escapeHtml(f.name)}</h3>
-        ${adminToken ? `
+        ${currentWriteToken() ? `
           <div class="folder-actions">
             ${idx > 0 ? `<button class="btn-icon" data-action="move-up" data-id="${f.id}" title="Move earlier">↑</button>` : ''}
             ${idx < folders.length-1 ? `<button class="btn-icon" data-action="move-down" data-id="${f.id}" title="Move later">↓</button>` : ''}
@@ -1394,7 +1588,7 @@ function renderFolderView(){
 
   if(!folders.length && !files.length){
     html += `<div class="empty-state">${ICONS.folder}<p>${q ? 'No results for "'+escapeHtml(search)+'".' : 'This folder is empty.'}</p>
-      ${(adminToken && !q) ? `<button class="btn btn-primary btn-sm" id="empty-upload-btn">⬆ Upload the first file</button>` : ''}
+      ${(currentWriteToken() && !q) ? `<button class="btn btn-primary btn-sm" id="empty-upload-btn">⬆ Upload the first file</button>` : ''}
     </div>`;
   }
 
@@ -1409,7 +1603,7 @@ function renderFolderView(){
     });
   });
 
-  if(adminToken){
+  if(currentWriteToken()){
     const nf = document.getElementById('new-folder-btn'); if(nf) nf.onclick = openNewFolderModal;
     const up = document.getElementById('upload-btn'); if(up) up.onclick = openUploadModal;
     const eup = document.getElementById('empty-upload-btn'); if(eup) eup.onclick = openUploadModal;
@@ -1481,7 +1675,7 @@ function entryRowHtml(f){
           <a class="link-btn" href="${escapeHtml(f.webViewLink||'#')}" target="_blank" rel="noopener">Open ↗</a>
           <button class="chat-doc-btn" data-action="chat-about-file" data-id="${f.id}" data-name="${escapeHtml(f.name)}" title="Ask about this document">💬</button>
         </div>
-        ${adminToken ? `
+        ${currentWriteToken() ? `
           <div class="entry-actions">
             <button class="btn-icon" data-action="edit-details" data-id="${f.id}" title="Edit details">☰</button>
             <button class="btn-icon" data-action="rename-file" data-id="${f.id}" data-name="${escapeHtml(f.name)}" title="Rename">✎</button>
@@ -1657,11 +1851,13 @@ async function deleteFolder(folderId, name){
 // ===================== INIT =====================
 renderAdminArea();
 loadPageText();
-loadChatAccessList();
+loadChatAccessList().then(renderChatWidget);
 renderChatWidget();
 checkForRedirectToken().then(() => {
   history.replaceState({ stack: JSON.parse(JSON.stringify(stack)) }, '', location.pathname + location.search);
   renderAdminArea();
+  loadPageText();
+  loadChatAccessList().then(renderChatWidget);
   renderChatWidget();
   loadAndRender();
 });
